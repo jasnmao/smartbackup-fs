@@ -1,0 +1,66 @@
+# 智能备份文件系统配置
+# 生成时间：@CMAKE_CURRENT_DATE@
+# 版本：@PROJECT_VERSION@
+
+storage:
+  # 存储设置
+  block_size: 4096
+  max_file_size: "16TB"
+  max_files: 1000000
+  
+  # 缓存设置
+  cache_size: "128MB"
+  cache_levels:
+    - memory: "64MB"
+    - mmap: "256MB"
+    - disk: "1GB"
+
+compression:
+  # 压缩设置
+  enabled: false
+  algorithms:
+    - name: lz4
+      level: 3
+    - name: zstd
+      level: 5
+  skip_patterns:
+    - "*.jpg"
+    - "*.png"
+    - "*.gz"
+    - "*.zip"
+
+versioning:
+  # 版本管理设置
+  enabled: false
+  policies:
+    - type: time
+      interval: "1h"
+    - type: size
+      threshold: "1MB"
+    - type: manual
+      enabled: true
+  
+  retention:
+    max_versions: 100
+    max_age: "30d"
+    max_size: "10GB"
+
+deduplication:
+  # 去重设置
+  enabled: false
+  block_size: "4KB"
+  algorithm: "sha256"
+
+logging:
+  # 日志设置
+  level: "INFO"
+  file: "/var/log/smartbackupfs.log"
+  max_size: "100MB"
+  backup_count: 5
+
+performance:
+  # 性能设置
+  read_ahead: "1MB"
+  write_behind: "4KB"
+  max_threads: 100
+  io_timeout: 30
