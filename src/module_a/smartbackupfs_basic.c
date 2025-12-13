@@ -31,19 +31,32 @@ extern int add_directory_entry(directory_t *dir, const char *name, file_metadata
 
 // 外部函数声明
 extern file_metadata_t *lookup_path(const char *path);
+extern int smart_read_file(file_metadata_t *meta, char *buf, size_t size, off_t offset);
+extern int smart_write_file(file_metadata_t *meta, const char *buf, size_t size, off_t offset);
+
+// 块映射管理外部声明
+extern block_map_t *get_block_map(uint64_t file_ino);
+extern void destroy_block_map(block_map_t *map);
+extern int hash_table_remove(hash_table_t *table, uint64_t key);
+
+// 全局变量外部声明
+extern hash_table_t *block_maps;
+extern pthread_mutex_t block_maps_mutex;
 
 // 获取文件属性
 static int smartbackupfs_getattr(const char *path, struct stat *stbuf,
-                                struct fuse_file_info *fi) {
+                                 struct fuse_file_info *fi)
+{
     (void)fi;
-    
+
     memset(stbuf, 0, sizeof(struct stat));
-    
+
     file_metadata_t *meta = lookup_path(path);
-    if (!meta) {
+    if (!meta)
+    {
         return -ENOENT;
     }
-    
+
     stbuf->st_ino = meta->ino;
     stbuf->st_mode = meta->mode;
     stbuf->st_nlink = meta->nlink;
@@ -54,27 +67,29 @@ static int smartbackupfs_getattr(const char *path, struct stat *stbuf,
     stbuf->st_atim = meta->atime;
     stbuf->st_mtim = meta->mtime;
     stbuf->st_ctim = meta->ctime;
-    
+
     return 0;
 }
 
 // 创建目录
-static int smartbackupfs_mkdir(const char *path, mode_t mode) {
+static int smartbackupfs_mkdir(const char *path, mode_t mode)
+{
     // 检查目录是否已存在
-    if (lookup_path(path)) {
+    if (lookup_path(path))
+    {
         return -EEXIST;
     }
-    
+
     // 分配新的inode
     pthread_mutex_lock(&fs_state.ino_mutex);
     ino_t new_ino = fs_state.next_ino++;
     pthread_mutex_unlock(&fs_state.ino_mutex);
-    
+
     // 创建目录元数据
     directory_t *new_dir = calloc(1, sizeof(directory_t));
     new_dir->meta.ino = new_ino;
     new_dir->meta.mode = S_IFDIR | (mode & 07777);
-    new_dir->meta.nlink = 2;  // '.'和父目录
+    new_dir->meta.nlink = 2; // '.'和父目录
     new_dir->meta.uid = fuse_get_context()->uid;
     new_dir->meta.gid = fuse_get_context()->gid;
     new_dir->meta.size = DEFAULT_BLOCK_SIZE;
@@ -83,326 +98,366 @@ static int smartbackupfs_mkdir(const char *path, mode_t mode) {
     new_dir->meta.mtime = new_dir->meta.atime;
     new_dir->meta.ctime = new_dir->meta.atime;
     pthread_rwlock_init(&new_dir->lock, NULL);
-    
+
     // 创建目录项
     dir_entry_t *new_entry = malloc(sizeof(dir_entry_t));
     const char *name = strrchr(path, '/');
-    if (!name) name = path;
-    else name++;
-    
+    if (!name)
+        name = path;
+    else
+        name++;
+
     new_entry->name = strdup(name);
     new_entry->meta = &new_dir->meta;
     new_entry->next = NULL;
-    
+
     // 添加到父目录
     pthread_rwlock_wrlock(&fs_state.root->lock);
-    if (fs_state.root->entries) {
+    if (fs_state.root->entries)
+    {
         dir_entry_t *last = fs_state.root->entries;
-        while (last->next) last = last->next;
+        while (last->next)
+            last = last->next;
         last->next = new_entry;
-    } else {
+    }
+    else
+    {
         fs_state.root->entries = new_entry;
     }
     pthread_rwlock_unlock(&fs_state.root->lock);
-    
+
     // 添加到缓存
     cache_set(new_dir->meta.ino, new_dir);
-    
+
     fs_state.total_dirs++;
     fs_state.total_blocks++;
-    
+
     return 0;
 }
 
 // 删除文件
-static int smartbackupfs_unlink(const char *path) {
+static int smartbackupfs_unlink(const char *path)
+{
     pthread_rwlock_wrlock(&fs_state.root->lock);
-    
+
     dir_entry_t **entry_ptr = &fs_state.root->entries;
 
-    
     const char *name = strrchr(path, '/');
-    if (!name) name = path;
-    else name++;
-    
-    while (*entry_ptr) {
-        if (strcmp((*entry_ptr)->name, name) == 0) {
+    if (!name)
+        name = path;
+    else
+        name++;
+
+    while (*entry_ptr)
+    {
+        if (strcmp((*entry_ptr)->name, name) == 0)
+        {
             dir_entry_t *to_delete = *entry_ptr;
-            
+
             // 检查是否是目录
-            if (S_ISDIR(to_delete->meta->mode)) {
+            if (S_ISDIR(to_delete->meta->mode))
+            {
                 pthread_rwlock_unlock(&fs_state.root->lock);
                 return -EISDIR;
             }
-            
+
             // 从链表中删除
             *entry_ptr = to_delete->next;
-            
-            // 释放资源
+
+            // 减少链接计数
+            to_delete->meta->nlink--;
+            clock_gettime(CLOCK_REALTIME, &to_delete->meta->ctime);
+
+            // 如果链接计数为0，才真正删除文件数据和元数据
+            if (to_delete->meta->nlink == 0)
+            {
+                // 清理文件数据块映射
+                block_map_t *map = get_block_map(to_delete->meta->ino);
+                if (map)
+                {
+                    // 销毁块映射会释放所有数据块
+                    destroy_block_map(map);
+
+                    // 从块映射表中移除
+                    pthread_mutex_lock(&block_maps_mutex);
+                    hash_table_remove(block_maps, to_delete->meta->ino);
+                    pthread_mutex_unlock(&block_maps_mutex);
+                }
+
+                // 从缓存中移除
+                cache_remove(to_delete->meta->ino);
+
+                // 清理扩展属性
+                if (to_delete->meta->xattr)
+                {
+                    free(to_delete->meta->xattr);
+                }
+
+                free(to_delete->meta);
+                fs_state.total_files--;
+                fs_state.total_blocks -= to_delete->meta->blocks;
+            }
+
             free(to_delete->name);
-            // 简化实现：数据块管理已移至缓存
-            
-            // 从缓存中移除
-            cache_remove(to_delete->meta->ino);
-            
-            free(to_delete->meta);
             free(to_delete);
-            
-            fs_state.total_files--;
-            fs_state.total_blocks -= to_delete->meta->blocks;
-            
+
             pthread_rwlock_unlock(&fs_state.root->lock);
             return 0;
         }
         entry_ptr = &(*entry_ptr)->next;
     }
-    
+
     pthread_rwlock_unlock(&fs_state.root->lock);
     return -ENOENT;
 }
 
 // 删除目录
-static int smartbackupfs_rmdir(const char *path) {
-    if (strcmp(path, "/") == 0) {
-        return -EBUSY;  // 不能删除根目录
+static int smartbackupfs_rmdir(const char *path)
+{
+    if (strcmp(path, "/") == 0)
+    {
+        return -EBUSY; // 不能删除根目录
     }
-    
+
     pthread_rwlock_wrlock(&fs_state.root->lock);
-    
+
     dir_entry_t **entry_ptr = &fs_state.root->entries;
-    
+
     const char *name = strrchr(path, '/');
-    if (!name) name = path;
-    else name++;
-    
-    while (*entry_ptr) {
-        if (strcmp((*entry_ptr)->name, name) == 0) {
+    if (!name)
+        name = path;
+    else
+        name++;
+
+    while (*entry_ptr)
+    {
+        if (strcmp((*entry_ptr)->name, name) == 0)
+        {
             dir_entry_t *to_delete = *entry_ptr;
-            
+
             // 检查是否是目录
-            if (!S_ISDIR(to_delete->meta->mode)) {
+            if (!S_ISDIR(to_delete->meta->mode))
+            {
                 pthread_rwlock_unlock(&fs_state.root->lock);
                 return -ENOTDIR;
             }
-            
+
             // 检查目录是否为空
-            directory_t *dir = (directory_t*)to_delete->meta;
-            if (dir->entries) {
+            directory_t *dir = (directory_t *)to_delete->meta;
+            if (dir->entries)
+            {
                 pthread_rwlock_unlock(&fs_state.root->lock);
                 return -ENOTEMPTY;
             }
-            
+
             // 从链表中删除
             *entry_ptr = to_delete->next;
-            
+
             // 释放资源
             free(to_delete->name);
             pthread_rwlock_destroy(&dir->lock);
-            
+
             // 从缓存中移除
             cache_remove(to_delete->meta->ino);
-            
+
             free(to_delete->meta);
             free(to_delete);
-            
+
             fs_state.total_dirs--;
             fs_state.total_blocks--;
-            
+
             pthread_rwlock_unlock(&fs_state.root->lock);
             return 0;
         }
         entry_ptr = &(*entry_ptr)->next;
     }
-    
+
     pthread_rwlock_unlock(&fs_state.root->lock);
     return -ENOENT;
 }
 
 // 重命名/移动文件
 static int smartbackupfs_rename(const char *from, const char *to,
-                               unsigned int flags) {
+                                unsigned int flags)
+{
     (void)flags;
-    
+
     // 简化实现：只支持根目录下的重命名
     file_metadata_t *src_meta = lookup_path(from);
-    if (!src_meta) {
+    if (!src_meta)
+    {
         return -ENOENT;
     }
-    
+
     // 检查目标是否已存在
     file_metadata_t *dst_meta = lookup_path(to);
-    if (dst_meta) {
+    if (dst_meta)
+    {
         return -EEXIST;
     }
-    
+
     pthread_rwlock_wrlock(&fs_state.root->lock);
-    
+
     // 查找源目录项
     const char *src_name = strrchr(from, '/');
-    if (!src_name) src_name = from;
-    else src_name++;
-    
+    if (!src_name)
+        src_name = from;
+    else
+        src_name++;
+
     dir_entry_t *entry = fs_state.root->entries;
-    while (entry) {
-        if (strcmp(entry->name, src_name) == 0) {
+    while (entry)
+    {
+        if (strcmp(entry->name, src_name) == 0)
+        {
             // 更新文件名
             free(entry->name);
             const char *dst_name = strrchr(to, '/');
-            if (!dst_name) dst_name = to;
-            else dst_name++;
+            if (!dst_name)
+                dst_name = to;
+            else
+                dst_name++;
             entry->name = strdup(dst_name);
             break;
         }
         entry = entry->next;
     }
-    
+
     pthread_rwlock_unlock(&fs_state.root->lock);
-    
+
     // 更新修改时间
     clock_gettime(CLOCK_REALTIME, &src_meta->mtime);
-    
+
     return 0;
 }
 
 // 截断文件
 static int smartbackupfs_truncate(const char *path, off_t size,
-                                 struct fuse_file_info *fi) {
+                                  struct fuse_file_info *fi)
+{
     (void)fi;
-    
+
     file_metadata_t *meta = lookup_path(path);
-    if (!meta) {
+    if (!meta)
+    {
         return -ENOENT;
     }
-    
-    if (S_ISDIR(meta->mode)) {
+
+    if (S_ISDIR(meta->mode))
+    {
         return -EISDIR;
     }
-    
-    if (size < 0) {
+
+    if (size < 0)
+    {
         return -EINVAL;
     }
-    
-    if (size == meta->size) {
+
+    if (size == meta->size)
+    {
         return 0;
     }
-    
+
     // 调整数据缓冲区大小
     // 简化实现：只更新文件大小，不管理实际数据
     // 实际项目应该使用数据块管理
-    
+
     meta->size = size;
     meta->blocks = (size + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
-    
+
     // 更新修改时间
     clock_gettime(CLOCK_REALTIME, &meta->mtime);
-    
+
     return 0;
 }
 
 // 打开文件
-static int smartbackupfs_open(const char *path, struct fuse_file_info *fi) {
+static int smartbackupfs_open(const char *path, struct fuse_file_info *fi)
+{
     file_metadata_t *meta = lookup_path(path);
-    if (!meta) {
+    if (!meta)
+    {
         return -ENOENT;
     }
-    
-    if (S_ISDIR(meta->mode)) {
+
+    if (S_ISDIR(meta->mode))
+    {
         return -EISDIR;
     }
-    
+
     // 检查访问权限
-    if ((fi->flags & O_ACCMODE) == O_RDONLY) {
-        if (!(meta->mode & S_IRUSR)) {
-            return -EACCES;
-        }
-    } else if ((fi->flags & O_ACCMODE) == O_WRONLY ||
-               (fi->flags & O_ACCMODE) == O_RDWR) {
-        if (!(meta->mode & S_IWUSR)) {
+    if ((fi->flags & O_ACCMODE) == O_RDONLY)
+    {
+        if (!(meta->mode & S_IRUSR))
+        {
             return -EACCES;
         }
     }
-    
+    else if ((fi->flags & O_ACCMODE) == O_WRONLY ||
+             (fi->flags & O_ACCMODE) == O_RDWR)
+    {
+        if (!(meta->mode & S_IWUSR))
+        {
+            return -EACCES;
+        }
+    }
+
     // 更新访问时间
     clock_gettime(CLOCK_REALTIME, &meta->atime);
-    
+
     return 0;
 }
 
 // 读取文件
 static int smartbackupfs_read(const char *path, char *buf, size_t size,
-                             off_t offset, struct fuse_file_info *fi) {
+                              off_t offset, struct fuse_file_info *fi)
+{
     (void)fi;
-    
+
     file_metadata_t *meta = lookup_path(path);
-    if (!meta) {
+    if (!meta)
+    {
         return -ENOENT;
     }
-    
-    if (S_ISDIR(meta->mode)) {
+
+    if (S_ISDIR(meta->mode))
+    {
         return -EISDIR;
     }
-    
-    if (offset < 0) {
-        return -EINVAL;
-    }
-    
-    if (offset >= meta->size) {
-        return 0;
-    }
-    
-    size_t remaining = meta->size - offset;
-    if (size > remaining) {
-        size = remaining;
-    }
-    
-    // 简化实现：返回空数据，实际应该从数据块读取
-    memset(buf, 0, size);
-    
-    // 更新访问时间
-    clock_gettime(CLOCK_REALTIME, &meta->atime);
-    
-    return size;
+
+    // 使用高性能读取函数
+    return smart_read_file(meta, buf, size, offset);
 }
 
 // 写入文件
 static int smartbackupfs_write(const char *path, const char *buf, size_t size,
-                              off_t offset, struct fuse_file_info *fi) {
+                               off_t offset, struct fuse_file_info *fi)
+{
     (void)fi;
-    
+
     file_metadata_t *meta = lookup_path(path);
-    if (!meta) {
+    if (!meta)
+    {
         return -ENOENT;
     }
-    
-    if (S_ISDIR(meta->mode)) {
+
+    if (S_ISDIR(meta->mode))
+    {
         return -EISDIR;
     }
-    
-    if (offset < 0) {
-        return -EINVAL;
-    }
-    
-    // 确保有足够空间
-    off_t new_size = offset + size;
-    // 简化实现：只更新大小，不存储实际数据
-    if (new_size > meta->size) {
-        meta->size = new_size;
-        meta->blocks = (new_size + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
-    }
-    
-    // 更新修改时间
-    clock_gettime(CLOCK_REALTIME, &meta->mtime);
-    
-    return size;
+
+    // 使用高性能写入函数
+    return smart_write_file(meta, buf, size, offset);
 }
 
 // 同步文件
 static int smartbackupfs_fsync(const char *path, int isdatasync,
-                              struct fuse_file_info *fi) {
+                               struct fuse_file_info *fi)
+{
     (void)path;
     (void)isdatasync;
     (void)fi;
-    
+
     // 在这个内存文件系统中，fsync操作直接返回成功
     // 在实际项目中，这里应该将数据写入持久化存储
     return 0;
@@ -410,50 +465,55 @@ static int smartbackupfs_fsync(const char *path, int isdatasync,
 
 // 读取目录
 static int smartbackupfs_readdir(const char *path, void *buf,
-                                fuse_fill_dir_t filler, off_t offset,
-                                struct fuse_file_info *fi,
-                                enum fuse_readdir_flags flags) {
+                                 fuse_fill_dir_t filler, off_t offset,
+                                 struct fuse_file_info *fi,
+                                 enum fuse_readdir_flags flags)
+{
     (void)offset;
     (void)fi;
     (void)flags;
-    
-    if (strcmp(path, "/") != 0) {
+
+    if (strcmp(path, "/") != 0)
+    {
         return -ENOENT;
     }
-    
+
     // 添加标准目录项
     filler(buf, ".", NULL, 0, 0);
     filler(buf, "..", NULL, 0, 0);
-    
+
     // 添加目录中的文件
     pthread_rwlock_rdlock(&fs_state.root->lock);
     dir_entry_t *entry = fs_state.root->entries;
-    while (entry) {
+    while (entry)
+    {
         filler(buf, entry->name, NULL, 0, 0);
         entry = entry->next;
     }
     pthread_rwlock_unlock(&fs_state.root->lock);
-    
+
     return 0;
 }
 
 // 创建文件
 static int smartbackupfs_create(const char *path, mode_t mode,
-                               struct fuse_file_info *fi) {
+                                struct fuse_file_info *fi)
+{
     // 检查文件是否已存在
-    if (lookup_path(path)) {
+    if (lookup_path(path))
+    {
         return -EEXIST;
     }
-    
+
     // 分配新的inode
     pthread_mutex_lock(&fs_state.ino_mutex);
     ino_t new_ino = fs_state.next_ino++;
     pthread_mutex_unlock(&fs_state.ino_mutex);
-    
+
     // 创建文件元数据
     file_metadata_t *new_file = malloc(sizeof(file_metadata_t));
     memset(new_file, 0, sizeof(file_metadata_t));
-    
+
     new_file->ino = new_ino;
     new_file->mode = S_IFREG | (mode & 07777);
     new_file->nlink = 1;
@@ -464,119 +524,476 @@ static int smartbackupfs_create(const char *path, mode_t mode,
     clock_gettime(CLOCK_REALTIME, &new_file->atime);
     new_file->mtime = new_file->atime;
     new_file->ctime = new_file->atime;
-    
+
     // 创建目录项
     dir_entry_t *new_entry = malloc(sizeof(dir_entry_t));
     const char *name = strrchr(path, '/');
-    if (!name) name = path;
-    else name++;
-    
+    if (!name)
+        name = path;
+    else
+        name++;
+
     new_entry->name = strdup(name);
     new_entry->meta = new_file;
     new_entry->next = NULL;
-    
+
     // 添加到父目录
     pthread_rwlock_wrlock(&fs_state.root->lock);
-    if (fs_state.root->entries) {
+    if (fs_state.root->entries)
+    {
         dir_entry_t *last = fs_state.root->entries;
-        while (last->next) last = last->next;
+        while (last->next)
+            last = last->next;
         last->next = new_entry;
-    } else {
+    }
+    else
+    {
         fs_state.root->entries = new_entry;
     }
     pthread_rwlock_unlock(&fs_state.root->lock);
-    
+
     // 添加到缓存
     cache_set(new_file->ino, new_file);
-    
+
     fs_state.total_files++;
-    
+
     // 设置文件描述符
-    if (fi) {
+    if (fi)
+    {
         fi->fh = (uint64_t)new_file;
     }
-    
+
     return 0;
 }
 
 // 更新时间戳
 static int smartbackupfs_utimens(const char *path, const struct timespec ts[2],
-                                struct fuse_file_info *fi) {
+                                 struct fuse_file_info *fi)
+{
     (void)fi;
-    
+
     file_metadata_t *meta = lookup_path(path);
-    if (!meta) {
+    if (!meta)
+    {
         return -ENOENT;
     }
-    
-    if (ts) {
+
+    if (ts)
+    {
         meta->atime = ts[0];
         meta->mtime = ts[1];
-    } else {
+    }
+    else
+    {
         clock_gettime(CLOCK_REALTIME, &meta->atime);
         meta->mtime = meta->atime;
     }
+
+    return 0;
+}
+
+// 刷新文件（flush操作）
+static int smartbackupfs_flush(const char *path, struct fuse_file_info *fi)
+{
+    (void)path;
+    (void)fi;
+
+    // 内存文件系统中，flush直接返回成功
+    // 在实际项目中，这里应该确保所有缓存数据写入存储
+    return 0;
+}
+
+// 释放文件句柄（release操作）
+static int smartbackupfs_release(const char *path, struct fuse_file_info *fi)
+{
+    (void)path;
+    (void)fi;
+
+    // 清理文件句柄相关资源
+    return 0;
+}
+
+// 创建符号链接
+static int smartbackupfs_symlink(const char *target, const char *linkpath)
+{
+    // 检查链接是否已存在
+    if (lookup_path(linkpath))
+    {
+        return -EEXIST;
+    }
+
+    // 分配新的inode
+    pthread_mutex_lock(&fs_state.ino_mutex);
+    ino_t new_ino = fs_state.next_ino++;
+    pthread_mutex_unlock(&fs_state.ino_mutex);
+
+    // 创建符号链接元数据
+    file_metadata_t *new_link = malloc(sizeof(file_metadata_t));
+    memset(new_link, 0, sizeof(file_metadata_t));
+
+    new_link->ino = new_ino;
+    new_link->type = FT_SYMLINK;
+    new_link->mode = S_IFLNK | 0777;
+    new_link->nlink = 1;
+    new_link->uid = fuse_get_context()->uid;
+    new_link->gid = fuse_get_context()->gid;
+    new_link->size = strlen(target);
+    new_link->blocks = (new_link->size + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
+    clock_gettime(CLOCK_REALTIME, &new_link->atime);
+    new_link->mtime = new_link->atime;
+    new_link->ctime = new_link->atime;
+
+    // 存储目标路径作为扩展属性
+    new_link->xattr = strdup(target);
+    new_link->xattr_size = strlen(target) + 1;
+
+    // 创建目录项
+    dir_entry_t *new_entry = malloc(sizeof(dir_entry_t));
+    const char *name = strrchr(linkpath, '/');
+    if (!name)
+        name = linkpath;
+    else
+        name++;
+
+    new_entry->name = strdup(name);
+    new_entry->meta = new_link;
+    new_entry->next = NULL;
+
+    // 添加到父目录
+    pthread_rwlock_wrlock(&fs_state.root->lock);
+    if (fs_state.root->entries)
+    {
+        dir_entry_t *last = fs_state.root->entries;
+        while (last->next)
+            last = last->next;
+        last->next = new_entry;
+    }
+    else
+    {
+        fs_state.root->entries = new_entry;
+    }
+    pthread_rwlock_unlock(&fs_state.root->lock);
+
+    // 添加到缓存
+    cache_set(new_link->ino, new_link);
+
+    fs_state.total_files++;
+
+    return 0;
+}
+
+// 读取符号链接
+static int smartbackupfs_readlink(const char *path, char *buf, size_t size)
+{
+    file_metadata_t *meta = lookup_path(path);
+    if (!meta)
+    {
+        return -ENOENT;
+    }
+
+    if (!S_ISLNK(meta->mode))
+    {
+        return -EINVAL;
+    }
+
+    if (!meta->xattr)
+    {
+        return -ENODATA;
+    }
+
+    size_t target_len = strlen(meta->xattr);
+    if (size == 0)
+    {
+        return target_len;
+    }
+
+    size_t copy_len = (target_len < size) ? target_len : size - 1;
+    if (copy_len > 0)
+    {
+        memcpy(buf, meta->xattr, copy_len);
+    }
     
+    // 如果缓冲区足够大，添加null终止符（FUSE要求）
+    if (copy_len < size)
+    {
+        buf[copy_len] = '\0';
+    }
+
+    return copy_len;
+}
+
+// 创建硬链接
+static int smartbackupfs_link(const char *oldpath, const char *newpath)
+{
+    file_metadata_t *src_meta = lookup_path(oldpath);
+    if (!src_meta)
+    {
+        return -ENOENT;
+    }
+
+    if (S_ISDIR(src_meta->mode))
+    {
+        return -EPERM; // 不能对目录创建硬链接
+    }
+
+    // 检查目标是否已存在
+    if (lookup_path(newpath))
+    {
+        return -EEXIST;
+    }
+
+    // 创建新的目录项
+    dir_entry_t *new_entry = malloc(sizeof(dir_entry_t));
+    const char *name = strrchr(newpath, '/');
+    if (!name)
+        name = newpath;
+    else
+        name++;
+
+    new_entry->name = strdup(name);
+    new_entry->meta = src_meta; // 指向相同的元数据
+    new_entry->next = NULL;
+
+    // 添加到父目录
+    pthread_rwlock_wrlock(&fs_state.root->lock);
+    if (fs_state.root->entries)
+    {
+        dir_entry_t *last = fs_state.root->entries;
+        while (last->next)
+            last = last->next;
+        last->next = new_entry;
+    }
+    else
+    {
+        fs_state.root->entries = new_entry;
+    }
+
+    // 增加链接数
+    src_meta->nlink++;
+    clock_gettime(CLOCK_REALTIME, &src_meta->ctime);
+
+    pthread_rwlock_unlock(&fs_state.root->lock);
+
+    return 0;
+}
+
+// 获取扩展属性
+static int smartbackupfs_getxattr(const char *path, const char *name, char *value,
+                                  size_t size)
+{
+    file_metadata_t *meta = lookup_path(path);
+    if (!meta)
+    {
+        return -ENOENT;
+    }
+
+    // 简化实现：只支持系统定义的属性
+    if (strcmp(name, "user.comment") == 0)
+    {
+        if (!meta->xattr)
+        {
+            return -ENODATA;
+        }
+
+        size_t attr_len = strlen(meta->xattr);
+        if (size == 0)
+        {
+            return attr_len;
+        }
+
+        if (size < attr_len)
+        {
+            return -ERANGE;
+        }
+
+        memcpy(value, meta->xattr, attr_len);
+        return attr_len;
+    }
+
+    return -ENODATA;
+}
+
+// 设置扩展属性
+static int smartbackupfs_setxattr(const char *path, const char *name,
+                                  const char *value, size_t size, int flags)
+{
+    file_metadata_t *meta = lookup_path(path);
+    if (!meta)
+    {
+        return -ENOENT;
+    }
+
+    // 简化实现：只支持user.comment属性
+    if (strcmp(name, "user.comment") != 0)
+    {
+        return -ENOTSUP;
+    }
+
+    pthread_mutex_lock(&fs_state.ino_mutex);
+
+    // 释放旧的扩展属性
+    if (meta->xattr)
+    {
+        free(meta->xattr);
+    }
+
+    // 设置新的扩展属性
+    meta->xattr = malloc(size + 1);
+    if (!meta->xattr)
+    {
+        pthread_mutex_unlock(&fs_state.ino_mutex);
+        return -ENOMEM;
+    }
+
+    memcpy(meta->xattr, value, size);
+    meta->xattr[size] = '\0';
+    meta->xattr_size = size + 1;
+
+    pthread_mutex_unlock(&fs_state.ino_mutex);
+
+    // 更新状态改变时间
+    clock_gettime(CLOCK_REALTIME, &meta->ctime);
+
+    return 0;
+}
+
+// 列出扩展属性
+static int smartbackupfs_listxattr(const char *path, char *list, size_t size)
+{
+    file_metadata_t *meta = lookup_path(path);
+    if (!meta)
+    {
+        return -ENOENT;
+    }
+
+    // 简化实现：只返回user.comment（如果没有扩展属性则返回空）
+    if (!meta->xattr)
+    {
+        return 0; // 没有扩展属性
+    }
+
+    const char *attr_name = "user.comment";
+    size_t attr_len = strlen(attr_name);
+    size_t total_size = attr_len + 1; // +1 for null terminator
+
+    if (size == 0)
+    {
+        return total_size;
+    }
+
+    if (size < total_size)
+    {
+        return -ERANGE;
+    }
+
+    memcpy(list, attr_name, attr_len);
+    list[attr_len] = '\0'; // null terminated
+
+    return total_size;
+}
+
+// 删除扩展属性
+static int smartbackupfs_removexattr(const char *path, const char *name)
+{
+    file_metadata_t *meta = lookup_path(path);
+    if (!meta)
+    {
+        return -ENOENT;
+    }
+
+    if (strcmp(name, "user.comment") != 0)
+    {
+        return -ENODATA;
+    }
+
+    if (!meta->xattr)
+    {
+        return -ENODATA;
+    }
+
+    pthread_mutex_lock(&fs_state.ino_mutex);
+    free(meta->xattr);
+    meta->xattr = NULL;
+    meta->xattr_size = 0;
+    pthread_mutex_unlock(&fs_state.ino_mutex);
+
+    // 更新状态改变时间
+    clock_gettime(CLOCK_REALTIME, &meta->ctime);
+
     return 0;
 }
 
 // 释放文件系统资源
-static void smartbackupfs_destroy(void *private_data) {
+static void smartbackupfs_destroy(void *private_data)
+{
     (void)private_data;
-    
+
     // 清理根目录
-    if (fs_state.root) {
+    if (fs_state.root)
+    {
         dir_entry_t *entry = fs_state.root->entries;
-        while (entry) {
+        while (entry)
+        {
             dir_entry_t *next = entry->next;
-            
-            if (S_ISDIR(entry->meta->mode)) {
-                directory_t *dir = (directory_t*)entry->meta;
+
+            if (S_ISDIR(entry->meta->mode))
+            {
+                directory_t *dir = (directory_t *)entry->meta;
                 pthread_rwlock_destroy(&dir->lock);
             }
-            
+
             free(entry->name);
             free_inode(entry->meta);
             free(entry);
-            
+
             entry = next;
         }
-        
+
         pthread_rwlock_destroy(&fs_state.root->lock);
         free(fs_state.root);
     }
-    
+
     pthread_mutex_destroy(&fs_state.ino_mutex);
 }
 
 // FUSE操作结构
 static struct fuse_operations smartbackupfs_ops = {
-    .getattr    = smartbackupfs_getattr,
-    .mkdir      = smartbackupfs_mkdir,
-    .unlink     = smartbackupfs_unlink,
-    .rmdir      = smartbackupfs_rmdir,
-    .rename     = smartbackupfs_rename,
-    .truncate   = smartbackupfs_truncate,
-    .open       = smartbackupfs_open,
-    .read       = smartbackupfs_read,
-    .write      = smartbackupfs_write,
-    .fsync      = smartbackupfs_fsync,
-    .readdir    = smartbackupfs_readdir,
-    .create     = smartbackupfs_create,
-    .utimens    = smartbackupfs_utimens,
-    .destroy    = smartbackupfs_destroy,
+    .getattr = smartbackupfs_getattr,
+    .mkdir = smartbackupfs_mkdir,
+    .unlink = smartbackupfs_unlink,
+    .rmdir = smartbackupfs_rmdir,
+    .rename = smartbackupfs_rename,
+    .truncate = smartbackupfs_truncate,
+    .open = smartbackupfs_open,
+    .read = smartbackupfs_read,
+    .write = smartbackupfs_write,
+    .fsync = smartbackupfs_fsync,
+    .readdir = smartbackupfs_readdir,
+    .create = smartbackupfs_create,
+    .utimens = smartbackupfs_utimens,
+    .flush = smartbackupfs_flush,
+    .release = smartbackupfs_release,
+    .symlink = smartbackupfs_symlink,
+    .readlink = smartbackupfs_readlink,
+    .link = smartbackupfs_link,
+    .getxattr = smartbackupfs_getxattr,
+    .setxattr = smartbackupfs_setxattr,
+    .listxattr = smartbackupfs_listxattr,
+    .removexattr = smartbackupfs_removexattr,
+    .destroy = smartbackupfs_destroy,
 };
 
-int main(int argc, char *argv[]) {
+int main(int argc, char *argv[])
+{
     // 初始化文件系统
     fs_init();
-    
+
     printf("智能备份文件系统 v1.0\n");
     printf("支持的功能：\n");
     printf("  - 完整的POSIX文件操作\n");
     printf("  - 大文件支持（最大16TB）\n");
     printf("  - 线程安全并发访问\n");
     printf("  - 权限和时间戳管理\n");
-    
+
     return fuse_main(argc, argv, &smartbackupfs_ops, NULL);
 }

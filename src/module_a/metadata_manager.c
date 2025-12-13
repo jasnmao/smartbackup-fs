@@ -10,8 +10,270 @@
 #include <unistd.h>
 #include <stdio.h>
 
+// 哈希表辅助函数
+static uint64_t hash_function(uint64_t key, size_t size) {
+    // 使用FNV-1a哈希算法的变体
+    uint64_t hash = 14695981039346656037ULL;
+    key ^= 14695981039346656037ULL;
+    for (int i = 0; i < 8; i++) {
+        hash *= 1099511628211ULL;
+        hash ^= (key >> (i * 8)) & 0xFF;
+    }
+    return hash % size;
+}
+
+// 创建哈希表
+hash_table_t *hash_table_create(size_t size) {
+    hash_table_t *table = malloc(sizeof(hash_table_t));
+    if (!table) return NULL;
+    
+    table->buckets = calloc(size, sizeof(hash_node_t*));
+    if (!table->buckets) {
+        free(table);
+        return NULL;
+    }
+    
+    table->size = size;
+    table->count = 0;
+    pthread_rwlock_init(&table->lock, NULL);
+    
+    return table;
+}
+
+// 销毁哈希表
+void hash_table_destroy(hash_table_t *table) {
+    if (!table) return;
+    
+    pthread_rwlock_wrlock(&table->lock);
+    
+    for (size_t i = 0; i < table->size; i++) {
+        hash_node_t *node = table->buckets[i];
+        while (node) {
+            hash_node_t *next = node->next;
+            free(node);
+            node = next;
+        }
+    }
+    
+    free(table->buckets);
+    pthread_rwlock_unlock(&table->lock);
+    pthread_rwlock_destroy(&table->lock);
+    free(table);
+}
+
+// 设置哈希表值
+int hash_table_set(hash_table_t *table, uint64_t key, void *value) {
+    if (!table || !value) return -EINVAL;
+    
+    pthread_rwlock_wrlock(&table->lock);
+    
+    uint64_t index = hash_function(key, table->size);
+    hash_node_t *node = table->buckets[index];
+    
+    // 检查是否已存在
+    while (node) {
+        if (node->key == key) {
+            node->value = value;
+            node->access_time = time(NULL);
+            pthread_rwlock_unlock(&table->lock);
+            return 0;
+        }
+        node = node->next;
+    }
+    
+    // 创建新节点
+    hash_node_t *new_node = malloc(sizeof(hash_node_t));
+    if (!new_node) {
+        pthread_rwlock_unlock(&table->lock);
+        return -ENOMEM;
+    }
+    
+    new_node->key = key;
+    new_node->value = value;
+    new_node->next = table->buckets[index];
+    new_node->access_time = time(NULL);
+    
+    table->buckets[index] = new_node;
+    table->count++;
+    
+    pthread_rwlock_unlock(&table->lock);
+    return 0;
+}
+
+// 获取哈希表值
+void *hash_table_get(hash_table_t *table, uint64_t key) {
+    if (!table) return NULL;
+    
+    pthread_rwlock_rdlock(&table->lock);
+    
+    uint64_t index = hash_function(key, table->size);
+    hash_node_t *node = table->buckets[index];
+    
+    while (node) {
+        if (node->key == key) {
+            node->access_time = time(NULL);
+            void *value = node->value;
+            pthread_rwlock_unlock(&table->lock);
+            return value;
+        }
+        node = node->next;
+    }
+    
+    pthread_rwlock_unlock(&table->lock);
+    return NULL;
+}
+
+// 移除哈希表键值对
+int hash_table_remove(hash_table_t *table, uint64_t key) {
+    if (!table) return -EINVAL;
+    
+    pthread_rwlock_wrlock(&table->lock);
+    
+    uint64_t index = hash_function(key, table->size);
+    hash_node_t **prev = &table->buckets[index];
+    hash_node_t *node = *prev;
+    
+    while (node) {
+        if (node->key == key) {
+            *prev = node->next;
+            free(node);
+            table->count--;
+            pthread_rwlock_unlock(&table->lock);
+            return 0;
+        }
+        prev = &node->next;
+        node = node->next;
+    }
+    
+    pthread_rwlock_unlock(&table->lock);
+    return -ENOENT;
+}
+
+// 清空哈希表
+void hash_table_clear(hash_table_t *table) {
+    if (!table) return;
+    
+    pthread_rwlock_wrlock(&table->lock);
+    
+    for (size_t i = 0; i < table->size; i++) {
+        hash_node_t *node = table->buckets[i];
+        while (node) {
+            hash_node_t *next = node->next;
+            free(node);
+            node = next;
+        }
+        table->buckets[i] = NULL;
+    }
+    
+    table->count = 0;
+    pthread_rwlock_unlock(&table->lock);
+}
+
+// 获取哈希表大小
+size_t hash_table_size(hash_table_t *table) {
+    if (!table) return 0;
+    return table->count;
+}
+
+// 创建LRU缓存
+lru_cache_t *lru_cache_create(size_t max_size) {
+    lru_cache_t *cache = malloc(sizeof(lru_cache_t));
+    if (!cache) return NULL;
+    
+    cache->table = hash_table_create(max_size * 2);  // 使用2倍大小减少冲突
+    if (!cache->table) {
+        free(cache);
+        return NULL;
+    }
+    
+    cache->max_size = max_size;
+    cache->current_size = 0;
+    pthread_mutex_init(&cache->mutex, NULL);
+    
+    return cache;
+}
+
+// 销毁LRU缓存
+void lru_cache_destroy(lru_cache_t *cache) {
+    if (!cache) return;
+    
+    hash_table_destroy(cache->table);
+    pthread_mutex_destroy(&cache->mutex);
+    free(cache);
+}
+
+// LRU缓存放入
+int lru_cache_put(lru_cache_t *cache, uint64_t key, void *value) {
+    if (!cache || !value) return -EINVAL;
+    
+    pthread_mutex_lock(&cache->mutex);
+    
+    // 检查是否需要淘汰
+    if (hash_table_size(cache->table) >= cache->max_size) {
+        // 简化实现：随机淘汰一个项
+        for (size_t i = 0; i < cache->table->size; i++) {
+            hash_node_t *node = cache->table->buckets[i];
+            if (node) {
+                hash_table_remove(cache->table, node->key);
+                break;
+            }
+        }
+    }
+    
+    int result = hash_table_set(cache->table, key, value);
+    pthread_mutex_unlock(&cache->mutex);
+    
+    return result;
+}
+
+// LRU缓存获取
+void *lru_cache_get(lru_cache_t *cache, uint64_t key) {
+    if (!cache) return NULL;
+    
+    pthread_mutex_lock(&cache->mutex);
+    void *value = hash_table_get(cache->table, key);
+    pthread_mutex_unlock(&cache->mutex);
+    
+    return value;
+}
+
+// LRU缓存移除
+int lru_cache_remove(lru_cache_t *cache, uint64_t key) {
+    if (!cache) return -EINVAL;
+    
+    pthread_mutex_lock(&cache->mutex);
+    int result = hash_table_remove(cache->table, key);
+    pthread_mutex_unlock(&cache->mutex);
+    
+    return result;
+}
+
+// LRU缓存清空
+void lru_cache_clear(lru_cache_t *cache) {
+    if (!cache) return;
+    
+    pthread_mutex_lock(&cache->mutex);
+    hash_table_clear(cache->table);
+    pthread_mutex_unlock(&cache->mutex);
+}
+
 // 全局文件系统状态
 fs_state_t fs_state;
+
+// 块映射管理
+hash_table_t *block_maps = NULL;
+pthread_mutex_t block_maps_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// 静态缓存变量
+static lru_cache_t *inode_cache = NULL;
+static lru_cache_t *block_cache = NULL;
+static pthread_once_t cache_once = PTHREAD_ONCE_INIT;
+
+// 缓存初始化函数
+static void init_caches(void) {
+    inode_cache = lru_cache_create(10000);  // 10K个inode缓存
+    block_cache = lru_cache_create(5000);   // 5K个数据块缓存
+}
 
 // 初始化文件系统
 void fs_init(void) {
@@ -20,6 +282,9 @@ void fs_init(void) {
     // 初始化锁
     pthread_mutex_init(&fs_state.ino_mutex, NULL);
     pthread_rwlock_init(&fs_state.cache_lock, NULL);
+    
+    // 初始化块映射管理
+    block_maps = hash_table_create(10000);
     
     // 设置配置
     fs_state.block_size = DEFAULT_BLOCK_SIZE;
@@ -52,9 +317,6 @@ void fs_init(void) {
     fs_state.root->entries = NULL;
     fs_state.root->entry_count = 0;
     
-    // 初始化缓存
-    // TODO: 实现哈希表缓存
-    
     fs_state.next_ino = 2;
     fs_state.total_dirs = 1;
     fs_state.total_files = 0;
@@ -72,12 +334,6 @@ void fs_destroy(void) {
         while (entry) {
             dir_entry_t *next = entry->next;
             free(entry->name);
-            
-            // 清理文件数据
-            if (entry->meta->type == FT_REGULAR) {
-                // TODO: 清理数据块
-            }
-            
             free_inode(entry->meta);
             free(entry);
             entry = next;
@@ -397,20 +653,238 @@ int write_block(data_block_t *block, const char *buf, size_t size, off_t offset)
     return to_write;
 }
 
-// 缓存操作（简化实现）
+// 创建文件块映射
+block_map_t *create_block_map(uint64_t file_ino) {
+    block_map_t *map = malloc(sizeof(block_map_t));
+    if (!map) return NULL;
+    
+    map->file_ino = file_ino;
+    map->block_count = 0;
+    map->blocks = NULL;
+    map->direct_blocks = 12;  // 默认12个直接块
+    map->indirect_blocks = 0;
+    pthread_rwlock_init(&map->lock, NULL);
+    
+    return map;
+}
+
+// 销毁文件块映射
+void destroy_block_map(block_map_t *map) {
+    if (!map) return;
+    
+    pthread_rwlock_wrlock(&map->lock);
+    
+    // 释放所有数据块
+    for (uint64_t i = 0; i < map->block_count; i++) {
+        if (map->blocks[i]) {
+            free_block(map->blocks[i]);
+        }
+    }
+    
+    free(map->blocks);
+    pthread_rwlock_unlock(&map->lock);
+    pthread_rwlock_destroy(&map->lock);
+    free(map);
+}
+
+// 获取文件块映射
+block_map_t *get_block_map(uint64_t file_ino) {
+    pthread_mutex_lock(&block_maps_mutex);
+    block_map_t *map = hash_table_get(block_maps, file_ino);
+    
+    if (!map) {
+        map = create_block_map(file_ino);
+        if (map) {
+            hash_table_set(block_maps, file_ino, map);
+        }
+    }
+    
+    pthread_mutex_unlock(&block_maps_mutex);
+    return map;
+}
+
+// 高性能文件读取（支持大文件）
+int smart_read_file(file_metadata_t *meta, char *buf, size_t size, off_t offset) {
+    if (!meta || !buf || !S_ISREG(meta->mode)) {
+        return -EINVAL;
+    }
+    
+    if (offset < 0) return -EINVAL;
+    if (offset >= meta->size) return 0;
+    
+    size_t remaining = meta->size - offset;
+    if (size > remaining) size = remaining;
+    
+    block_map_t *map = get_block_map(meta->ino);
+    if (!map) return -ENOMEM;
+    
+    pthread_rwlock_rdlock(&map->lock);
+    
+    size_t bytes_read = 0;
+    size_t current_offset = offset;
+    size_t remaining_bytes = size;
+    
+    while (remaining_bytes > 0) {
+        uint64_t block_index = current_offset / fs_state.block_size;
+        size_t block_offset = current_offset % fs_state.block_size;
+        size_t bytes_to_read = fs_state.block_size - block_offset;
+        
+        if (bytes_to_read > remaining_bytes) {
+            bytes_to_read = remaining_bytes;
+        }
+        
+        if (block_index >= map->block_count) {
+            // 读取空数据（稀疏文件支持）
+            memset(buf + bytes_read, 0, bytes_to_read);
+        } else {
+            data_block_t *block = map->blocks[block_index];
+            if (block) {
+                int result = read_block(block, buf + bytes_read, bytes_to_read, block_offset);
+                if (result < 0) {
+                    pthread_rwlock_unlock(&map->lock);
+                    return result;
+                }
+                bytes_read += result;
+            } else {
+                // 空块，填充零
+                memset(buf + bytes_read, 0, bytes_to_read);
+                bytes_read += bytes_to_read;
+            }
+        }
+        
+        current_offset += bytes_to_read;
+        remaining_bytes -= bytes_to_read;
+    }
+    
+    pthread_rwlock_unlock(&map->lock);
+    
+    // 更新访问时间
+    clock_gettime(CLOCK_REALTIME, &meta->atime);
+    
+    return bytes_read;
+}
+
+// 高性能文件写入（支持大文件）
+int smart_write_file(file_metadata_t *meta, const char *buf, size_t size, off_t offset) {
+    if (!meta || !buf || !S_ISREG(meta->mode)) {
+        return -EINVAL;
+    }
+    
+    if (offset < 0) return -EINVAL;
+    
+    block_map_t *map = get_block_map(meta->ino);
+    if (!map) return -ENOMEM;
+    
+    pthread_rwlock_wrlock(&map->lock);
+    
+    // 检查是否需要扩展文件
+    off_t new_size = offset + size;
+    if (new_size > meta->size) {
+        meta->size = new_size;
+    }
+    
+    size_t bytes_written = 0;
+    size_t current_offset = offset;
+    size_t remaining_bytes = size;
+    
+    while (remaining_bytes > 0) {
+        uint64_t block_index = current_offset / fs_state.block_size;
+        size_t block_offset = current_offset % fs_state.block_size;
+        size_t bytes_to_write = fs_state.block_size - block_offset;
+        
+        if (bytes_to_write > remaining_bytes) {
+            bytes_to_write = remaining_bytes;
+        }
+        
+        // 扩展块映射数组
+        if (block_index >= map->block_count) {
+            size_t new_count = block_index + 1;
+            data_block_t **new_blocks = realloc(map->blocks, 
+                                               new_count * sizeof(data_block_t*));
+            if (!new_blocks) {
+                pthread_rwlock_unlock(&map->lock);
+                return -ENOMEM;
+            }
+            
+            // 初始化新增的块指针
+            for (size_t i = map->block_count; i < new_count; i++) {
+                new_blocks[i] = NULL;
+            }
+            
+            map->blocks = new_blocks;
+            map->block_count = new_count;
+        }
+        
+        // 分配数据块（如果需要）
+        if (!map->blocks[block_index]) {
+            map->blocks[block_index] = allocate_block(fs_state.block_size);
+            if (!map->blocks[block_index]) {
+                pthread_rwlock_unlock(&map->lock);
+                return -ENOMEM;
+            }
+            map->blocks[block_index]->file_ino = meta->ino;
+            map->blocks[block_index]->offset = block_index * fs_state.block_size;
+        }
+        
+        // 写入数据块
+        int result = write_block(map->blocks[block_index], 
+                                buf + bytes_written, bytes_to_write, block_offset);
+        if (result < 0) {
+            pthread_rwlock_unlock(&map->lock);
+            return result;
+        }
+        
+        bytes_written += result;
+        current_offset += result;
+        remaining_bytes -= result;
+    }
+    
+    // 更新文件块数
+    meta->blocks = (meta->size + fs_state.block_size - 1) / fs_state.block_size;
+    
+    pthread_rwlock_unlock(&map->lock);
+    
+    // 更新修改时间
+    clock_gettime(CLOCK_REALTIME, &meta->mtime);
+    
+    return bytes_written;
+}
+
+// 缓存操作
 void cache_set(uint64_t key, void *value) {
-    // 简化实现，实际应该使用真正的哈希表
+    pthread_once(&cache_once, init_caches);
+    
+    // 根据key范围判断缓存类型
+    if (key < 0x100000000ULL) {  // inode缓存
+        lru_cache_put(inode_cache, key, value);
+    } else {  // 数据块缓存
+        lru_cache_put(block_cache, key, value);
+    }
 }
 
 void *cache_get(uint64_t key) {
-    // 简化实现，实际应该使用真正的哈希表
-    return NULL;
+    pthread_once(&cache_once, init_caches);
+    
+    if (key < 0x100000000ULL) {
+        return lru_cache_get(inode_cache, key);
+    } else {
+        return lru_cache_get(block_cache, key);
+    }
 }
 
 void cache_remove(uint64_t key) {
-    // 简化实现，实际应该使用真正的哈希表
+    pthread_once(&cache_once, init_caches);
+    
+    if (key < 0x100000000ULL) {
+        lru_cache_remove(inode_cache, key);
+    } else {
+        lru_cache_remove(block_cache, key);
+    }
 }
 
 void cache_clear(void) {
-    // 简化实现，实际应该使用真正的哈希表
+    pthread_once(&cache_once, init_caches);
+    
+    lru_cache_clear(inode_cache);
+    lru_cache_clear(block_cache);
 }

@@ -11,6 +11,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <pthread.h>
+#include <time.h>
+#include <sys/types.h>
 
 // 配置常量
 #define MAX_PATH_LEN 4096
@@ -47,7 +49,7 @@ typedef struct {
 } file_metadata_t;
 
 // 文件数据块
-typedef struct {
+typedef struct data_block {
     uint64_t block_id;
     uint64_t file_ino;
     uint64_t offset;
@@ -56,6 +58,16 @@ typedef struct {
     uint32_t checksum;
     struct data_block *next;
 } data_block_t;
+
+// 文件块映射表（支持大文件）
+typedef struct {
+    uint64_t file_ino;
+    uint64_t block_count;
+    data_block_t **blocks;     // 动态数组，支持间接块
+    size_t direct_blocks;      // 直接块数量
+    size_t indirect_blocks;    // 间接块数量
+    pthread_rwlock_t lock;
+} block_map_t;
 
 // 目录项
 typedef struct dir_entry {
@@ -95,6 +107,29 @@ typedef struct {
     bool enable_compression;
     bool enable_deduplication;
 } fs_state_t;
+
+// 哈希表结构定义
+typedef struct hash_node {
+    uint64_t key;
+    void *value;
+    struct hash_node *next;
+    time_t access_time;
+} hash_node_t;
+
+typedef struct {
+    hash_node_t **buckets;
+    size_t size;
+    size_t count;
+    pthread_rwlock_t lock;
+} hash_table_t;
+
+// LRU缓存结构
+typedef struct {
+    hash_table_t *table;
+    size_t max_size;
+    size_t current_size;
+    pthread_mutex_t mutex;
+} lru_cache_t;
 
 // 全局文件系统状态
 extern fs_state_t fs_state;
