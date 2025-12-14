@@ -34,10 +34,66 @@ extern file_metadata_t *lookup_path(const char *path);
 extern int smart_read_file(file_metadata_t *meta, char *buf, size_t size, off_t offset);
 extern int smart_write_file(file_metadata_t *meta, const char *buf, size_t size, off_t offset);
 
+// 获取父目录
+static directory_t *get_parent_directory(const char *path, char **child_name)
+{
+    if (!path || path[0] != '/') {
+        return NULL;
+    }
+    
+    // 如果是根目录，返回NULL
+    if (strcmp(path, "/") == 0) {
+        return NULL;
+    }
+    
+    // 复制路径以便修改
+    char *path_copy = strdup(path);
+    char *last_slash = strrchr(path_copy, '/');
+    
+    if (!last_slash) {
+        free(path_copy);
+        return NULL;
+    }
+    
+    // 提取子文件名
+    if (child_name) {
+        *child_name = strdup(last_slash + 1);
+    }
+    
+    // 如果是根目录下的文件
+    if (last_slash == path_copy) {
+        free(path_copy);
+        return fs_state.root;
+    }
+    
+    // 截断到父目录路径
+    *last_slash = '\0';
+    
+    // 查找父目录
+    file_metadata_t *parent_meta = lookup_path(path_copy);
+    free(path_copy);
+    
+    if (!parent_meta || parent_meta->type != FT_DIRECTORY) {
+        if (*child_name) {
+            free(*child_name);
+            *child_name = NULL;
+        }
+        return NULL;
+    }
+    
+    // 直接将元数据转换为目录结构指针
+    // 在这个实现中，directory_t的第一个成员就是file_metadata_t
+    directory_t *parent_dir = (directory_t *)parent_meta;
+    
+    return parent_dir;
+}
+
 // 块映射管理外部声明
 extern block_map_t *get_block_map(uint64_t file_ino);
 extern void destroy_block_map(block_map_t *map);
 extern int hash_table_remove(hash_table_t *table, uint64_t key);
+
+
 
 // 全局变量外部声明
 extern hash_table_t *block_maps;
@@ -80,6 +136,14 @@ static int smartbackupfs_mkdir(const char *path, mode_t mode)
         return -EEXIST;
     }
 
+    // 获取父目录和目录名
+    char *child_name = NULL;
+    directory_t *parent_dir = get_parent_directory(path, &child_name);
+    if (!parent_dir || !child_name) {
+        if (child_name) free(child_name);
+        return -ENOENT;
+    }
+
     // 分配新的inode
     pthread_mutex_lock(&fs_state.ino_mutex);
     ino_t new_ino = fs_state.next_ino++;
@@ -94,6 +158,7 @@ static int smartbackupfs_mkdir(const char *path, mode_t mode)
     new_dir->meta.gid = fuse_get_context()->gid;
     new_dir->meta.size = DEFAULT_BLOCK_SIZE;
     new_dir->meta.blocks = 1;
+    new_dir->meta.type = FT_DIRECTORY;
     clock_gettime(CLOCK_REALTIME, &new_dir->meta.atime);
     new_dir->meta.mtime = new_dir->meta.atime;
     new_dir->meta.ctime = new_dir->meta.atime;
@@ -101,30 +166,26 @@ static int smartbackupfs_mkdir(const char *path, mode_t mode)
 
     // 创建目录项
     dir_entry_t *new_entry = malloc(sizeof(dir_entry_t));
-    const char *name = strrchr(path, '/');
-    if (!name)
-        name = path;
-    else
-        name++;
-
-    new_entry->name = strdup(name);
+    new_entry->name = strdup(child_name);
     new_entry->meta = &new_dir->meta;
     new_entry->next = NULL;
+    
+    free(child_name);
 
-    // 添加到父目录
-    pthread_rwlock_wrlock(&fs_state.root->lock);
-    if (fs_state.root->entries)
+    // 添加到正确的父目录
+    pthread_rwlock_wrlock(&parent_dir->lock);
+    if (parent_dir->entries)
     {
-        dir_entry_t *last = fs_state.root->entries;
+        dir_entry_t *last = parent_dir->entries;
         while (last->next)
             last = last->next;
         last->next = new_entry;
     }
     else
     {
-        fs_state.root->entries = new_entry;
+        parent_dir->entries = new_entry;
     }
-    pthread_rwlock_unlock(&fs_state.root->lock);
+    pthread_rwlock_unlock(&parent_dir->lock);
 
     // 添加到缓存
     cache_set(new_dir->meta.ino, new_dir);
@@ -473,25 +534,71 @@ static int smartbackupfs_readdir(const char *path, void *buf,
     (void)fi;
     (void)flags;
 
-    if (strcmp(path, "/") != 0)
-    {
-        return -ENOENT;
-    }
+    fprintf(stderr, "READDIR: path='%s'\n", path);
 
     // 添加标准目录项
     filler(buf, ".", NULL, 0, 0);
     filler(buf, "..", NULL, 0, 0);
 
+    // 查找目录
+    file_metadata_t *meta = lookup_path(path);
+    if (!meta) {
+        fprintf(stderr, "READDIR: directory not found for path '%s'\n", path);
+        return -ENOENT;
+    }
+    
+    if (meta->type != FT_DIRECTORY) {
+        fprintf(stderr, "READDIR: path '%s' is not a directory\n", path);
+        return -ENOTDIR;
+    }
+
+    // 直接将元数据转换为目录结构
+    directory_t *dir = (directory_t *)meta;
+    fprintf(stderr, "READDIR: found directory '%s', entries count\n", path);
+
     // 添加目录中的文件
-    pthread_rwlock_rdlock(&fs_state.root->lock);
-    dir_entry_t *entry = fs_state.root->entries;
+    pthread_rwlock_rdlock(&dir->lock);
+    dir_entry_t *entry = dir->entries;
+    int count = 0;
     while (entry)
     {
+        fprintf(stderr, "READDIR: adding entry '%s'\n", entry->name);
         filler(buf, entry->name, NULL, 0, 0);
         entry = entry->next;
+        count++;
     }
-    pthread_rwlock_unlock(&fs_state.root->lock);
+    pthread_rwlock_unlock(&dir->lock);
 
+    fprintf(stderr, "READDIR: path '%s' had %d entries\n", path, count);
+    return 0;
+}
+
+
+
+
+
+// 访问权限检查
+static int smartbackupfs_access(const char *path, int mask)
+{
+    file_metadata_t *meta = lookup_path(path);
+    if (!meta) {
+        // 如果文件不存在，但是要创建，检查父目录
+        char *path_copy = strdup(path);
+        char *last_slash = strrchr(path_copy, '/');
+        if (last_slash && last_slash != path_copy) {
+            *last_slash = '\0';
+            file_metadata_t *parent = lookup_path(path_copy);
+            free(path_copy);
+            if (parent && parent->type == FT_DIRECTORY) {
+                return 0; // 父目录存在且可访问
+            }
+        }
+        if (path_copy) free(path_copy);
+        return -ENOENT;
+    }
+    
+    // 简化的权限检查
+    // 实际实现需要根据mask检查具体的读/写/执行权限
     return 0;
 }
 
@@ -499,10 +606,23 @@ static int smartbackupfs_readdir(const char *path, void *buf,
 static int smartbackupfs_create(const char *path, mode_t mode,
                                 struct fuse_file_info *fi)
 {
+    // 添加调试信息
+    fprintf(stderr, "CREATE: path='%s', mode=0%o\n", path, mode);
+    
     // 检查文件是否已存在
     if (lookup_path(path))
     {
+        fprintf(stderr, "CREATE: file already exists\n");
         return -EEXIST;
+    }
+
+    // 获取父目录和文件名
+    char *child_name = NULL;
+    directory_t *parent_dir = get_parent_directory(path, &child_name);
+    if (!parent_dir || !child_name) {
+        fprintf(stderr, "CREATE: failed to get parent directory for '%s'\n", path);
+        if (child_name) free(child_name);
+        return -ENOENT;
     }
 
     // 分配新的inode
@@ -521,36 +641,33 @@ static int smartbackupfs_create(const char *path, mode_t mode,
     new_file->gid = fuse_get_context()->gid;
     new_file->size = 0;
     new_file->blocks = 0;
+    new_file->type = FT_REGULAR;
     clock_gettime(CLOCK_REALTIME, &new_file->atime);
     new_file->mtime = new_file->atime;
     new_file->ctime = new_file->atime;
 
     // 创建目录项
     dir_entry_t *new_entry = malloc(sizeof(dir_entry_t));
-    const char *name = strrchr(path, '/');
-    if (!name)
-        name = path;
-    else
-        name++;
-
-    new_entry->name = strdup(name);
+    new_entry->name = strdup(child_name);
     new_entry->meta = new_file;
     new_entry->next = NULL;
+    
+    free(child_name);
 
-    // 添加到父目录
-    pthread_rwlock_wrlock(&fs_state.root->lock);
-    if (fs_state.root->entries)
+    // 添加到正确的父目录
+    pthread_rwlock_wrlock(&parent_dir->lock);
+    if (parent_dir->entries)
     {
-        dir_entry_t *last = fs_state.root->entries;
+        dir_entry_t *last = parent_dir->entries;
         while (last->next)
             last = last->next;
         last->next = new_entry;
     }
     else
     {
-        fs_state.root->entries = new_entry;
+        parent_dir->entries = new_entry;
     }
-    pthread_rwlock_unlock(&fs_state.root->lock);
+    pthread_rwlock_unlock(&parent_dir->lock);
 
     // 添加到缓存
     cache_set(new_file->ino, new_file);
@@ -563,6 +680,7 @@ static int smartbackupfs_create(const char *path, mode_t mode,
         fi->fh = (uint64_t)new_file;
     }
 
+    fprintf(stderr, "CREATE: successfully created file '%s'\n", path);
     return 0;
 }
 
@@ -622,6 +740,14 @@ static int smartbackupfs_symlink(const char *target, const char *linkpath)
         return -EEXIST;
     }
 
+    // 获取父目录和链接名
+    char *child_name = NULL;
+    directory_t *parent_dir = get_parent_directory(linkpath, &child_name);
+    if (!parent_dir || !child_name) {
+        if (child_name) free(child_name);
+        return -ENOENT;
+    }
+
     // 分配新的inode
     pthread_mutex_lock(&fs_state.ino_mutex);
     ino_t new_ino = fs_state.next_ino++;
@@ -649,30 +775,26 @@ static int smartbackupfs_symlink(const char *target, const char *linkpath)
 
     // 创建目录项
     dir_entry_t *new_entry = malloc(sizeof(dir_entry_t));
-    const char *name = strrchr(linkpath, '/');
-    if (!name)
-        name = linkpath;
-    else
-        name++;
-
-    new_entry->name = strdup(name);
+    new_entry->name = strdup(child_name);
     new_entry->meta = new_link;
     new_entry->next = NULL;
+    
+    free(child_name);
 
-    // 添加到父目录
-    pthread_rwlock_wrlock(&fs_state.root->lock);
-    if (fs_state.root->entries)
+    // 添加到正确的父目录
+    pthread_rwlock_wrlock(&parent_dir->lock);
+    if (parent_dir->entries)
     {
-        dir_entry_t *last = fs_state.root->entries;
+        dir_entry_t *last = parent_dir->entries;
         while (last->next)
             last = last->next;
         last->next = new_entry;
     }
     else
     {
-        fs_state.root->entries = new_entry;
+        parent_dir->entries = new_entry;
     }
-    pthread_rwlock_unlock(&fs_state.root->lock);
+    pthread_rwlock_unlock(&parent_dir->lock);
 
     // 添加到缓存
     cache_set(new_link->ino, new_link);
@@ -980,6 +1102,7 @@ static struct fuse_operations smartbackupfs_ops = {
     .setxattr = smartbackupfs_setxattr,
     .listxattr = smartbackupfs_listxattr,
     .removexattr = smartbackupfs_removexattr,
+    .access = smartbackupfs_access,
     .destroy = smartbackupfs_destroy,
 };
 
