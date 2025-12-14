@@ -427,48 +427,58 @@ file_metadata_t *lookup_path(const char *path) {
     if (!path || path[0] != '/') {
         return NULL;
     }
-    
+
     if (strcmp(path, "/") == 0) {
         return &fs_state.root->meta;
     }
-    
-    // 简化路径解析（实际需要更复杂的实现）
+
+    // 使用可重入的分词以避免并发问题
     char *path_copy = strdup(path);
     if (!path_copy) {
         return NULL;
     }
-    
+
+    char *saveptr = NULL;
+    char *token = strtok_r(path_copy + 1, "/", &saveptr);
+
     directory_t *current_dir = fs_state.root;
     file_metadata_t *result = NULL;
-    
-    char *token = strtok(path_copy + 1, "/");
+
+    // 先锁住根目录再开始遍历
+    pthread_rwlock_rdlock(&current_dir->lock);
+
     while (token) {
-        pthread_rwlock_rdlock(&current_dir->lock);
-        
         dir_entry_t *entry = find_directory_entry(current_dir, token);
         if (!entry) {
             pthread_rwlock_unlock(&current_dir->lock);
+            result = NULL;
             break;
         }
-        
-        char *next_token = strtok(NULL, "/");
+
+        char *next_token = strtok_r(NULL, "/", &saveptr);
         if (!next_token) {
-            // 找到目标
+            // 找到目标元数据，返回
             result = entry->meta;
             pthread_rwlock_unlock(&current_dir->lock);
             break;
         }
-        
+
+        // 需要继续向下，但目标不是目录，失败
         if (entry->meta->type != FT_DIRECTORY) {
             pthread_rwlock_unlock(&current_dir->lock);
+            result = NULL;
             break;
         }
-        
-        current_dir = (directory_t *)entry->meta;
-        token = next_token;
+
+        // 切换到子目录：先锁住子目录，再释放父目录的锁，防止竞态
+        directory_t *next_dir = (directory_t *)entry->meta;
+        pthread_rwlock_rdlock(&next_dir->lock);
         pthread_rwlock_unlock(&current_dir->lock);
+
+        current_dir = next_dir;
+        token = next_token;
     }
-    
+
     free(path_copy);
     return result;
 }

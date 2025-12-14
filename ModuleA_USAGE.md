@@ -224,3 +224,7 @@ strace -o debug.log ./build/bin/smartbackup-fs /tmp/myfs -f
 ## 许可证
 
 本项目采用MIT许可证，详见LICENSE文件。
+
+## 最近修复 (Module A)
+
+- 2025-12-14: 修复 `lookup_path()` 路径遍历与锁管理问题，原实现存在在遍历子目录时错误释放/未释放读写锁的竞态，导致只能在根目录下创建文件。现在使用 `strtok_r` 并在切换到子目录前先获取子目录的读锁，再释放父目录锁，正确支持在子目录中创建/查找文件。
