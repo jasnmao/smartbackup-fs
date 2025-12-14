@@ -37,54 +37,61 @@ extern int smart_write_file(file_metadata_t *meta, const char *buf, size_t size,
 // 获取父目录
 static directory_t *get_parent_directory(const char *path, char **child_name)
 {
-    if (!path || path[0] != '/') {
+    if (!path || path[0] != '/')
+    {
         return NULL;
     }
-    
+
     // 如果是根目录，返回NULL
-    if (strcmp(path, "/") == 0) {
+    if (strcmp(path, "/") == 0)
+    {
         return NULL;
     }
-    
+
     // 复制路径以便修改
     char *path_copy = strdup(path);
     char *last_slash = strrchr(path_copy, '/');
-    
-    if (!last_slash) {
+
+    if (!last_slash)
+    {
         free(path_copy);
         return NULL;
     }
-    
+
     // 提取子文件名
-    if (child_name) {
+    if (child_name)
+    {
         *child_name = strdup(last_slash + 1);
     }
-    
+
     // 如果是根目录下的文件
-    if (last_slash == path_copy) {
+    if (last_slash == path_copy)
+    {
         free(path_copy);
         return fs_state.root;
     }
-    
+
     // 截断到父目录路径
     *last_slash = '\0';
-    
+
     // 查找父目录
     file_metadata_t *parent_meta = lookup_path(path_copy);
     free(path_copy);
-    
-    if (!parent_meta || parent_meta->type != FT_DIRECTORY) {
-        if (*child_name) {
+
+    if (!parent_meta || parent_meta->type != FT_DIRECTORY)
+    {
+        if (*child_name)
+        {
             free(*child_name);
             *child_name = NULL;
         }
         return NULL;
     }
-    
+
     // 直接将元数据转换为目录结构指针
     // 在这个实现中，directory_t的第一个成员就是file_metadata_t
     directory_t *parent_dir = (directory_t *)parent_meta;
-    
+
     return parent_dir;
 }
 
@@ -92,8 +99,6 @@ static directory_t *get_parent_directory(const char *path, char **child_name)
 extern block_map_t *get_block_map(uint64_t file_ino);
 extern void destroy_block_map(block_map_t *map);
 extern int hash_table_remove(hash_table_t *table, uint64_t key);
-
-
 
 // 全局变量外部声明
 extern hash_table_t *block_maps;
@@ -139,8 +144,10 @@ static int smartbackupfs_mkdir(const char *path, mode_t mode)
     // 获取父目录和目录名
     char *child_name = NULL;
     directory_t *parent_dir = get_parent_directory(path, &child_name);
-    if (!parent_dir || !child_name) {
-        if (child_name) free(child_name);
+    if (!parent_dir || !child_name)
+    {
+        if (child_name)
+            free(child_name);
         return -ENOENT;
     }
 
@@ -169,7 +176,7 @@ static int smartbackupfs_mkdir(const char *path, mode_t mode)
     new_entry->name = strdup(child_name);
     new_entry->meta = &new_dir->meta;
     new_entry->next = NULL;
-    
+
     free(child_name);
 
     // 添加到正确的父目录
@@ -199,26 +206,31 @@ static int smartbackupfs_mkdir(const char *path, mode_t mode)
 // 删除文件
 static int smartbackupfs_unlink(const char *path)
 {
-    pthread_rwlock_wrlock(&fs_state.root->lock);
+    // 获取父目录和文件名
+    char *child_name = NULL;
+    directory_t *parent_dir = get_parent_directory(path, &child_name);
+    if (!parent_dir || !child_name)
+    {
+        if (child_name)
+            free(child_name);
+        return -ENOENT;
+    }
 
-    dir_entry_t **entry_ptr = &fs_state.root->entries;
+    pthread_rwlock_wrlock(&parent_dir->lock);
 
-    const char *name = strrchr(path, '/');
-    if (!name)
-        name = path;
-    else
-        name++;
+    dir_entry_t **entry_ptr = &parent_dir->entries;
 
     while (*entry_ptr)
     {
-        if (strcmp((*entry_ptr)->name, name) == 0)
+        if (strcmp((*entry_ptr)->name, child_name) == 0)
         {
             dir_entry_t *to_delete = *entry_ptr;
 
             // 检查是否是目录
             if (S_ISDIR(to_delete->meta->mode))
             {
-                pthread_rwlock_unlock(&fs_state.root->lock);
+                pthread_rwlock_unlock(&parent_dir->lock);
+                free(child_name);
                 return -EISDIR;
             }
 
@@ -262,13 +274,15 @@ static int smartbackupfs_unlink(const char *path)
             free(to_delete->name);
             free(to_delete);
 
-            pthread_rwlock_unlock(&fs_state.root->lock);
+            pthread_rwlock_unlock(&parent_dir->lock);
+            free(child_name);
             return 0;
         }
         entry_ptr = &(*entry_ptr)->next;
     }
 
-    pthread_rwlock_unlock(&fs_state.root->lock);
+    pthread_rwlock_unlock(&parent_dir->lock);
+    free(child_name);
     return -ENOENT;
 }
 
@@ -280,26 +294,31 @@ static int smartbackupfs_rmdir(const char *path)
         return -EBUSY; // 不能删除根目录
     }
 
-    pthread_rwlock_wrlock(&fs_state.root->lock);
+    // 获取父目录和目录名
+    char *child_name = NULL;
+    directory_t *parent_dir = get_parent_directory(path, &child_name);
+    if (!parent_dir || !child_name)
+    {
+        if (child_name)
+            free(child_name);
+        return -ENOENT;
+    }
 
-    dir_entry_t **entry_ptr = &fs_state.root->entries;
+    pthread_rwlock_wrlock(&parent_dir->lock);
 
-    const char *name = strrchr(path, '/');
-    if (!name)
-        name = path;
-    else
-        name++;
+    dir_entry_t **entry_ptr = &parent_dir->entries;
 
     while (*entry_ptr)
     {
-        if (strcmp((*entry_ptr)->name, name) == 0)
+        if (strcmp((*entry_ptr)->name, child_name) == 0)
         {
             dir_entry_t *to_delete = *entry_ptr;
 
             // 检查是否是目录
             if (!S_ISDIR(to_delete->meta->mode))
             {
-                pthread_rwlock_unlock(&fs_state.root->lock);
+                pthread_rwlock_unlock(&parent_dir->lock);
+                free(child_name);
                 return -ENOTDIR;
             }
 
@@ -307,7 +326,8 @@ static int smartbackupfs_rmdir(const char *path)
             directory_t *dir = (directory_t *)to_delete->meta;
             if (dir->entries)
             {
-                pthread_rwlock_unlock(&fs_state.root->lock);
+                pthread_rwlock_unlock(&parent_dir->lock);
+                free(child_name);
                 return -ENOTEMPTY;
             }
 
@@ -327,13 +347,15 @@ static int smartbackupfs_rmdir(const char *path)
             fs_state.total_dirs--;
             fs_state.total_blocks--;
 
-            pthread_rwlock_unlock(&fs_state.root->lock);
+            pthread_rwlock_unlock(&parent_dir->lock);
+            free(child_name);
             return 0;
         }
         entry_ptr = &(*entry_ptr)->next;
     }
 
-    pthread_rwlock_unlock(&fs_state.root->lock);
+    pthread_rwlock_unlock(&parent_dir->lock);
+    free(child_name);
     return -ENOENT;
 }
 
@@ -343,7 +365,6 @@ static int smartbackupfs_rename(const char *from, const char *to,
 {
     (void)flags;
 
-    // 简化实现：只支持根目录下的重命名
     file_metadata_t *src_meta = lookup_path(from);
     if (!src_meta)
     {
@@ -357,37 +378,102 @@ static int smartbackupfs_rename(const char *from, const char *to,
         return -EEXIST;
     }
 
-    pthread_rwlock_wrlock(&fs_state.root->lock);
-
-    // 查找源目录项
-    const char *src_name = strrchr(from, '/');
-    if (!src_name)
-        src_name = from;
-    else
-        src_name++;
-
-    dir_entry_t *entry = fs_state.root->entries;
-    while (entry)
+    // 获取源父目录和源文件名
+    char *src_child_name = NULL;
+    directory_t *src_parent_dir = get_parent_directory(from, &src_child_name);
+    if (!src_parent_dir || !src_child_name)
     {
-        if (strcmp(entry->name, src_name) == 0)
-        {
-            // 更新文件名
-            free(entry->name);
-            const char *dst_name = strrchr(to, '/');
-            if (!dst_name)
-                dst_name = to;
-            else
-                dst_name++;
-            entry->name = strdup(dst_name);
-            break;
-        }
-        entry = entry->next;
+        if (src_child_name)
+            free(src_child_name);
+        return -ENOENT;
     }
 
-    pthread_rwlock_unlock(&fs_state.root->lock);
+    // 获取目标父目录和目标文件名
+    char *dst_child_name = NULL;
+    directory_t *dst_parent_dir = get_parent_directory(to, &dst_child_name);
+    if (!dst_parent_dir || !dst_child_name)
+    {
+        free(src_child_name);
+        if (dst_child_name)
+            free(dst_child_name);
+        return -ENOENT;
+    }
 
-    // 更新修改时间
+    // 如果源和目标在不同目录，需要移动
+    bool same_dir = (src_parent_dir == dst_parent_dir);
+
+    if (!same_dir)
+    {
+        // 需要先从源目录删除，再添加到目标目录
+        pthread_rwlock_wrlock(&src_parent_dir->lock);
+
+        // 查找并从源目录删除
+        dir_entry_t **src_entry_ptr = &src_parent_dir->entries;
+        dir_entry_t *move_entry = NULL;
+
+        while (*src_entry_ptr)
+        {
+            if (strcmp((*src_entry_ptr)->name, src_child_name) == 0)
+            {
+                move_entry = *src_entry_ptr;
+                *src_entry_ptr = (*src_entry_ptr)->next;
+                break;
+            }
+            src_entry_ptr = &(*src_entry_ptr)->next;
+        }
+
+        pthread_rwlock_unlock(&src_parent_dir->lock);
+
+        if (!move_entry)
+        {
+            free(src_child_name);
+            free(dst_child_name);
+            return -ENOENT;
+        }
+
+        // 更新文件名并添加到目标目录
+        pthread_rwlock_wrlock(&dst_parent_dir->lock);
+
+        free(move_entry->name);
+        move_entry->name = strdup(dst_child_name);
+        move_entry->next = dst_parent_dir->entries;
+        dst_parent_dir->entries = move_entry;
+
+        // 更新目标目录的修改时间
+        clock_gettime(CLOCK_REALTIME, &dst_parent_dir->meta.mtime);
+        dst_parent_dir->meta.ctime = dst_parent_dir->meta.mtime;
+
+        pthread_rwlock_unlock(&dst_parent_dir->lock);
+    }
+    else
+    {
+        // 同目录重命名
+        pthread_rwlock_wrlock(&src_parent_dir->lock);
+
+        dir_entry_t *entry = src_parent_dir->entries;
+        while (entry)
+        {
+            if (strcmp(entry->name, src_child_name) == 0)
+            {
+                free(entry->name);
+                entry->name = strdup(dst_child_name);
+                break;
+            }
+            entry = entry->next;
+        }
+
+        // 更新目录修改时间
+        clock_gettime(CLOCK_REALTIME, &src_parent_dir->meta.mtime);
+        src_parent_dir->meta.ctime = src_parent_dir->meta.mtime;
+
+        pthread_rwlock_unlock(&src_parent_dir->lock);
+    }
+
+    // 更新文件修改时间
     clock_gettime(CLOCK_REALTIME, &src_meta->mtime);
+
+    free(src_child_name);
+    free(dst_child_name);
 
     return 0;
 }
@@ -542,12 +628,14 @@ static int smartbackupfs_readdir(const char *path, void *buf,
 
     // 查找目录
     file_metadata_t *meta = lookup_path(path);
-    if (!meta) {
+    if (!meta)
+    {
         fprintf(stderr, "READDIR: directory not found for path '%s'\n", path);
         return -ENOENT;
     }
-    
-    if (meta->type != FT_DIRECTORY) {
+
+    if (meta->type != FT_DIRECTORY)
+    {
         fprintf(stderr, "READDIR: path '%s' is not a directory\n", path);
         return -ENOTDIR;
     }
@@ -573,30 +661,30 @@ static int smartbackupfs_readdir(const char *path, void *buf,
     return 0;
 }
 
-
-
-
-
 // 访问权限检查
 static int smartbackupfs_access(const char *path, int mask)
 {
     file_metadata_t *meta = lookup_path(path);
-    if (!meta) {
+    if (!meta)
+    {
         // 如果文件不存在，但是要创建，检查父目录
         char *path_copy = strdup(path);
         char *last_slash = strrchr(path_copy, '/');
-        if (last_slash && last_slash != path_copy) {
+        if (last_slash && last_slash != path_copy)
+        {
             *last_slash = '\0';
             file_metadata_t *parent = lookup_path(path_copy);
             free(path_copy);
-            if (parent && parent->type == FT_DIRECTORY) {
+            if (parent && parent->type == FT_DIRECTORY)
+            {
                 return 0; // 父目录存在且可访问
             }
         }
-        if (path_copy) free(path_copy);
+        if (path_copy)
+            free(path_copy);
         return -ENOENT;
     }
-    
+
     // 简化的权限检查
     // 实际实现需要根据mask检查具体的读/写/执行权限
     return 0;
@@ -608,7 +696,7 @@ static int smartbackupfs_create(const char *path, mode_t mode,
 {
     // 添加调试信息
     fprintf(stderr, "CREATE: path='%s', mode=0%o\n", path, mode);
-    
+
     // 检查文件是否已存在
     if (lookup_path(path))
     {
@@ -619,9 +707,11 @@ static int smartbackupfs_create(const char *path, mode_t mode,
     // 获取父目录和文件名
     char *child_name = NULL;
     directory_t *parent_dir = get_parent_directory(path, &child_name);
-    if (!parent_dir || !child_name) {
+    if (!parent_dir || !child_name)
+    {
         fprintf(stderr, "CREATE: failed to get parent directory for '%s'\n", path);
-        if (child_name) free(child_name);
+        if (child_name)
+            free(child_name);
         return -ENOENT;
     }
 
@@ -651,7 +741,7 @@ static int smartbackupfs_create(const char *path, mode_t mode,
     new_entry->name = strdup(child_name);
     new_entry->meta = new_file;
     new_entry->next = NULL;
-    
+
     free(child_name);
 
     // 添加到正确的父目录
@@ -743,8 +833,10 @@ static int smartbackupfs_symlink(const char *target, const char *linkpath)
     // 获取父目录和链接名
     char *child_name = NULL;
     directory_t *parent_dir = get_parent_directory(linkpath, &child_name);
-    if (!parent_dir || !child_name) {
-        if (child_name) free(child_name);
+    if (!parent_dir || !child_name)
+    {
+        if (child_name)
+            free(child_name);
         return -ENOENT;
     }
 
@@ -778,7 +870,7 @@ static int smartbackupfs_symlink(const char *target, const char *linkpath)
     new_entry->name = strdup(child_name);
     new_entry->meta = new_link;
     new_entry->next = NULL;
-    
+
     free(child_name);
 
     // 添加到正确的父目录
@@ -834,7 +926,7 @@ static int smartbackupfs_readlink(const char *path, char *buf, size_t size)
     {
         memcpy(buf, meta->xattr, copy_len);
     }
-    
+
     // 如果缓冲区足够大，添加null终止符（FUSE要求）
     if (copy_len < size)
     {
@@ -864,37 +956,47 @@ static int smartbackupfs_link(const char *oldpath, const char *newpath)
         return -EEXIST;
     }
 
+    // 获取目标父目录和链接名
+    char *child_name = NULL;
+    directory_t *parent_dir = get_parent_directory(newpath, &child_name);
+    if (!parent_dir || !child_name)
+    {
+        if (child_name)
+            free(child_name);
+        return -ENOENT;
+    }
+
     // 创建新的目录项
     dir_entry_t *new_entry = malloc(sizeof(dir_entry_t));
-    const char *name = strrchr(newpath, '/');
-    if (!name)
-        name = newpath;
-    else
-        name++;
-
-    new_entry->name = strdup(name);
+    new_entry->name = strdup(child_name);
     new_entry->meta = src_meta; // 指向相同的元数据
     new_entry->next = NULL;
 
-    // 添加到父目录
-    pthread_rwlock_wrlock(&fs_state.root->lock);
-    if (fs_state.root->entries)
+    free(child_name);
+
+    // 添加到正确的父目录
+    pthread_rwlock_wrlock(&parent_dir->lock);
+    if (parent_dir->entries)
     {
-        dir_entry_t *last = fs_state.root->entries;
+        dir_entry_t *last = parent_dir->entries;
         while (last->next)
             last = last->next;
         last->next = new_entry;
     }
     else
     {
-        fs_state.root->entries = new_entry;
+        parent_dir->entries = new_entry;
     }
 
     // 增加链接数
     src_meta->nlink++;
     clock_gettime(CLOCK_REALTIME, &src_meta->ctime);
 
-    pthread_rwlock_unlock(&fs_state.root->lock);
+    // 更新父目录修改时间
+    clock_gettime(CLOCK_REALTIME, &parent_dir->meta.mtime);
+    parent_dir->meta.ctime = parent_dir->meta.mtime;
+
+    pthread_rwlock_unlock(&parent_dir->lock);
 
     return 0;
 }
