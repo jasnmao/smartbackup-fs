@@ -7,6 +7,14 @@ CMakeFiles/
 cmake_install.cmake
 Makefile
 *.cmake
+compile_commands.json
+*.ninja
+*.ninja_deps
+*.ninja_log
+
+# Build outputs
+bin/
+*.d
 
 # Compiled binaries
 *.o
@@ -16,8 +24,17 @@ Makefile
 
 # IDE files
 .vscode/
+.idea/
+.clangd
+.cache/
 *.swp
 *.swo
+
+# Local tooling noise
+nohup.out
+*.out
+*.orig
+*.rej
 
 # System files
 .DS_Store

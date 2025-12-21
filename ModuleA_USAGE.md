@@ -26,10 +26,10 @@
 
 ```bash
 # Ubuntu/Debian
-sudo apt-get install libfuse3-dev libzstd-dev liblz4-dev
+sudo apt-get install libfuse3-dev libzstd-dev liblz4-dev attr
 
 # CentOS/RHEL
-sudo yum install fuse3-devel zstd-devel lz4-devel
+sudo yum install fuse3-devel zstd-devel lz4-devel attr
 ```
 
 ### 2. 构建项目

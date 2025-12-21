@@ -13,10 +13,10 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Debug)
 endif()
 
-# 输出目录
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+# 输出目录（使用相对路径）
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY bin)
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY lib)
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY lib)
 
 # 查找依赖包
 find_package(PkgConfig REQUIRED)
@@ -31,24 +31,26 @@ find_library(ZSTD_LIB zstd REQUIRED)
 find_library(LZ4_LIB lz4 REQUIRED)
 find_package(Threads REQUIRED)
 
-# 定义项目源文件
+# 定义项目源文件（使用相对路径）
 set(SMARTBACKUPFS_SOURCES
     src/module_a/smartbackupfs_basic.c
     src/module_a/metadata_manager.c
     src/module_a/posix_operations.c
+    src/module_b/version_manager.c
 )
 
 set(SMARTBACKUPFS_HEADERS
     include/smartbackupfs.h
     include/metadata.h
+    include/version_manager.h
 )
 
 # 可执行文件
 add_executable(smartbackup-fs ${SMARTBACKUPFS_SOURCES})
 
-# 包含目录
+# 包含目录（使用相对路径）
 target_include_directories(smartbackup-fs PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    include
     ${FUSE3_INCLUDE_DIRS}
 )
 
@@ -100,5 +102,9 @@ add_test(NAME test_compilation
 # add_subdirectory(src/module_c)
 # add_subdirectory(src/module_d)
 
-# 添加配置
-configure_file(configs/config.yaml.in configs/config.yaml @ONLY)
+# 添加配置（使用相对路径）
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/configs/config.yaml.in
+    ${CMAKE_CURRENT_BINARY_DIR}/config.yaml
+    @ONLY
+)

@@ -6,6 +6,7 @@
 #define FUSE_USE_VERSION 31
 
 #include "smartbackupfs.h"
+#include "version_manager.h"
 #include <fuse3/fuse.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -234,6 +235,9 @@ static int smartbackupfs_unlink(const char *path)
                 return -EISDIR;
             }
 
+            // 在删除前创建版本快照（事件触发策略）
+            version_manager_create_version(to_delete->meta, "unlink");
+
             // 从链表中删除
             *entry_ptr = to_delete->next;
 
@@ -370,6 +374,9 @@ static int smartbackupfs_rename(const char *from, const char *to,
     {
         return -ENOENT;
     }
+
+    // 在重命名前创建版本快照（事件触发策略）
+    version_manager_create_version(src_meta, "rename");
 
     // 检查目标是否已存在
     file_metadata_t *dst_meta = lookup_path(to);
@@ -594,7 +601,13 @@ static int smartbackupfs_write(const char *path, const char *buf, size_t size,
     }
 
     // 使用高性能写入函数
-    return smart_write_file(meta, buf, size, offset);
+    int ret = smart_write_file(meta, buf, size, offset);
+    if (ret >= 0)
+    {
+        /* 变化策略：块级差异 >10% 触发版本 */
+        version_manager_maybe_change_snapshot(meta);
+    }
+    return ret;
 }
 
 // 同步文件
@@ -621,6 +634,36 @@ static int smartbackupfs_readdir(const char *path, void *buf,
     (void)flags;
 
     fprintf(stderr, "READDIR: path='%s'\n", path);
+
+    // 支持 filename@versions 路径，列出版本
+    if (strstr(path, "@versions") != NULL)
+    {
+        // 解析基础路径（去掉@versions部分）
+        char *path_copy = strdup(path);
+        char *at = strrchr(path_copy, '@');
+        if (at)
+            *at = '\0';
+
+        file_metadata_t *base = lookup_path(path_copy);
+        free(path_copy);
+        if (!base)
+            return -ENOENT;
+
+        char **list = NULL;
+        size_t count = 0;
+        if (version_manager_list_versions(base, &list, &count) == 0)
+        {
+            // 列表中每个版本作为目录项返回
+            for (size_t i = 0; i < count; i++)
+            {
+                filler(buf, list[i], NULL, 0, 0);
+                free(list[i]);
+            }
+            free(list);
+            return 0;
+        }
+        return 0;
+    }
 
     // 添加标准目录项
     filler(buf, ".", NULL, 0, 0);
@@ -1011,7 +1054,7 @@ static int smartbackupfs_getxattr(const char *path, const char *name, char *valu
         return -ENOENT;
     }
 
-    // 简化实现：只支持系统定义的属性
+    // 简化实现：支持 user.comment 与 user.version.pinned
     if (strcmp(name, "user.comment") == 0)
     {
         if (!meta->xattr)
@@ -1034,6 +1077,18 @@ static int smartbackupfs_getxattr(const char *path, const char *name, char *valu
         return attr_len;
     }
 
+    if (strcmp(name, "user.version.pinned") == 0)
+    {
+        const char *val = meta->version_pinned ? "1" : "0";
+        size_t attr_len = strlen(val) + 1;
+        if (size == 0)
+            return attr_len;
+        if (size < attr_len)
+            return -ERANGE;
+        memcpy(value, val, attr_len);
+        return attr_len;
+    }
+
     return -ENODATA;
 }
 
@@ -1047,38 +1102,41 @@ static int smartbackupfs_setxattr(const char *path, const char *name,
         return -ENOENT;
     }
 
-    // 简化实现：只支持user.comment属性
-    if (strcmp(name, "user.comment") != 0)
+    if (strcmp(name, "user.comment") == 0)
     {
-        return -ENOTSUP;
-    }
-
-    pthread_mutex_lock(&fs_state.ino_mutex);
-
-    // 释放旧的扩展属性
-    if (meta->xattr)
-    {
-        free(meta->xattr);
-    }
-
-    // 设置新的扩展属性
-    meta->xattr = malloc(size + 1);
-    if (!meta->xattr)
-    {
+        pthread_mutex_lock(&fs_state.ino_mutex);
+        if (meta->xattr)
+            free(meta->xattr);
+        meta->xattr = malloc(size + 1);
+        if (!meta->xattr)
+        {
+            pthread_mutex_unlock(&fs_state.ino_mutex);
+            return -ENOMEM;
+        }
+        memcpy(meta->xattr, value, size);
+        meta->xattr[size] = '\0';
+        meta->xattr_size = size + 1;
         pthread_mutex_unlock(&fs_state.ino_mutex);
-        return -ENOMEM;
+        clock_gettime(CLOCK_REALTIME, &meta->ctime);
+        return 0;
     }
 
-    memcpy(meta->xattr, value, size);
-    meta->xattr[size] = '\0';
-    meta->xattr_size = size + 1;
+    if (strcmp(name, "user.version.pinned") == 0)
+    {
+        meta->version_pinned = true;
+        clock_gettime(CLOCK_REALTIME, &meta->ctime);
+        return 0;
+    }
 
-    pthread_mutex_unlock(&fs_state.ino_mutex);
+    if (strcmp(name, "user.version.create") == 0)
+    {
+        /* 手动快照触发 */
+        version_manager_create_manual(meta, "manual-xattr");
+        clock_gettime(CLOCK_REALTIME, &meta->ctime);
+        return 0;
+    }
 
-    // 更新状态改变时间
-    clock_gettime(CLOCK_REALTIME, &meta->ctime);
-
-    return 0;
+    return -ENOTSUP;
 }
 
 // 列出扩展属性
@@ -1090,28 +1148,21 @@ static int smartbackupfs_listxattr(const char *path, char *list, size_t size)
         return -ENOENT;
     }
 
-    // 简化实现：只返回user.comment（如果没有扩展属性则返回空）
-    if (!meta->xattr)
-    {
-        return 0; // 没有扩展属性
-    }
-
-    const char *attr_name = "user.comment";
-    size_t attr_len = strlen(attr_name);
-    size_t total_size = attr_len + 1; // +1 for null terminator
+    const char *attrs[] = {"user.comment", "user.version.pinned", "user.version.create"};
+    size_t lens[3] = {strlen(attrs[0]) + 1, strlen(attrs[1]) + 1, strlen(attrs[2]) + 1};
+    size_t total_size = lens[0] + lens[1] + lens[2];
 
     if (size == 0)
-    {
         return total_size;
-    }
-
     if (size < total_size)
-    {
         return -ERANGE;
-    }
 
-    memcpy(list, attr_name, attr_len);
-    list[attr_len] = '\0'; // null terminated
+    char *p = list;
+    memcpy(p, attrs[0], lens[0]);
+    p += lens[0];
+    memcpy(p, attrs[1], lens[1]);
+    p += lens[1];
+    memcpy(p, attrs[2], lens[2]);
 
     return total_size;
 }
@@ -1125,26 +1176,27 @@ static int smartbackupfs_removexattr(const char *path, const char *name)
         return -ENOENT;
     }
 
-    if (strcmp(name, "user.comment") != 0)
+    if (strcmp(name, "user.comment") == 0)
     {
-        return -ENODATA;
+        if (!meta->xattr)
+            return -ENODATA;
+        pthread_mutex_lock(&fs_state.ino_mutex);
+        free(meta->xattr);
+        meta->xattr = NULL;
+        meta->xattr_size = 0;
+        pthread_mutex_unlock(&fs_state.ino_mutex);
+        clock_gettime(CLOCK_REALTIME, &meta->ctime);
+        return 0;
     }
 
-    if (!meta->xattr)
+    if (strcmp(name, "user.version.pinned") == 0)
     {
-        return -ENODATA;
+        meta->version_pinned = false;
+        clock_gettime(CLOCK_REALTIME, &meta->ctime);
+        return 0;
     }
 
-    pthread_mutex_lock(&fs_state.ino_mutex);
-    free(meta->xattr);
-    meta->xattr = NULL;
-    meta->xattr_size = 0;
-    pthread_mutex_unlock(&fs_state.ino_mutex);
-
-    // 更新状态改变时间
-    clock_gettime(CLOCK_REALTIME, &meta->ctime);
-
-    return 0;
+    return -ENODATA;
 }
 
 // 释放文件系统资源
@@ -1213,12 +1265,18 @@ int main(int argc, char *argv[])
     // 初始化文件系统
     fs_init();
 
-    printf("智能备份文件系统 v1.0\n");
+    printf("智能备份文件系统 v3.0\n");
     printf("支持的功能：\n");
     printf("  - 完整的POSIX文件操作\n");
     printf("  - 大文件支持（最大16TB）\n");
     printf("  - 线程安全并发访问\n");
     printf("  - 权限和时间戳管理\n");
+    printf("  - 透明版本管理：rename/unlink 事件前自动快照\n");
+    printf("  - 变化感知版本：写入后块级差异 >10%% 自动建版\n");
+    printf("  - 周期版本：后台线程按 version_time_interval 定期创建\n");
+    printf("  - 手动快照：xattr user.version.create 触发，支持 pinned 跳过清理\n");
+    printf("  - 版本访问：filename@vN / @latest / 时间表达式（2h/1d/yesterday）\n");
+    printf("  - 版本列表：filename@versions 列出历史版本\n");
 
     return fuse_main(argc, argv, &smartbackupfs_ops, NULL);
 }

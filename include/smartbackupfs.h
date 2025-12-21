@@ -43,6 +43,10 @@ typedef struct {
     struct timespec mtime;  // 修改时间
     struct timespec ctime;  // 状态改变时间
     uint32_t version;       // 版本号
+    uint32_t version_count; // 版本总数（模块B扩展）
+    uint64_t latest_version_id; // 最新版本ID（模块B维护）
+    time_t last_version_time; // 最近一次创建版本的时间戳
+    bool version_pinned;    // 是否标记为重要版本，清理时跳过
     uint64_t parent_ino;    // 父目录inode
     char *xattr;           // 扩展属性
     size_t xattr_size;     // 扩展属性大小
@@ -66,6 +70,8 @@ typedef struct {
     data_block_t **blocks;     // 动态数组，支持间接块
     size_t direct_blocks;      // 直接块数量
     size_t indirect_blocks;    // 间接块数量
+    uint64_t *version_block_ids; // 版本间块映射（模块B增量存储预留）
+    size_t version_block_capacity;
     pthread_rwlock_t lock;
 } block_map_t;
 
@@ -83,6 +89,9 @@ typedef struct {
     pthread_rwlock_t lock;
     uint64_t entry_count;
 } directory_t;
+
+// 前向声明（供fs_state引用）
+typedef struct lru_cache lru_cache_t;
 
 // 文件系统状态
 typedef struct {
@@ -106,6 +115,12 @@ typedef struct {
     size_t max_cache_size;
     bool enable_compression;
     bool enable_deduplication;
+    // 版本管理配置与缓存（模块B）
+    lru_cache_t *version_cache; /* 版本元数据缓存，独立于inode/block缓存 */
+    pthread_t version_cleaner_thread; /* 版本清理后台线程 */
+    uint32_t version_time_interval; /* 定时创建版本的时间间隔（秒） */
+    uint32_t version_retention_count; /* 保留最近版本数量 */
+    uint32_t version_retention_days; /* 保留版本的天数 */
 } fs_state_t;
 
 // 哈希表结构定义
@@ -124,7 +139,7 @@ typedef struct {
 } hash_table_t;
 
 // LRU缓存结构
-typedef struct {
+typedef struct lru_cache {
     hash_table_t *table;
     size_t max_size;
     size_t current_size;

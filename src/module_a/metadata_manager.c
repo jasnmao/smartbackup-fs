@@ -3,6 +3,7 @@
  */
 
 #include "smartbackupfs.h"
+#include "version_manager.h"
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -369,6 +370,11 @@ void fs_init(void)
     fs_state.total_files = 0;
     fs_state.total_blocks = 0;
     fs_state.used_blocks = 0;
+
+    /* 初始化模块B：版本管理 */
+    version_manager_init();
+    /* 启动版本清理后台线程 */
+    version_manager_start_cleaner();
 }
 
 // 销毁文件系统
@@ -396,6 +402,9 @@ void fs_destroy(void)
 
     // 清理缓存
     cache_clear();
+
+    /* 销毁版本管理模块 */
+    version_manager_destroy();
 
     // 销毁锁
     pthread_mutex_destroy(&fs_state.ino_mutex);
@@ -509,9 +518,25 @@ file_metadata_t *lookup_path(const char *path)
 
     while (token)
     {
-        dir_entry_t *entry = find_directory_entry(current_dir, token);
+        /* 拆分 token 处理 @version/@versions 语法 */
+        char *atpos = strchr(token, '@');
+        char *base_token = NULL;
+        char *ver_token = NULL;
+        if (atpos)
+        {
+            base_token = strndup(token, atpos - token);
+            ver_token = strdup(atpos + 1);
+        }
+        else
+        {
+            base_token = strdup(token);
+        }
+
+        dir_entry_t *entry = find_directory_entry(current_dir, base_token);
+        free(base_token);
         if (!entry)
         {
+            free(ver_token);
             pthread_rwlock_unlock(&current_dir->lock);
             result = NULL;
             break;
@@ -520,11 +545,31 @@ file_metadata_t *lookup_path(const char *path)
         char *next_token = strtok_r(NULL, "/", &saveptr);
         if (!next_token)
         {
-            // 找到目标元数据，返回
+            if (ver_token)
+            {
+                if (strcmp(ver_token, "versions") == 0)
+                {
+                    /* 交由 readdir 处理，返回列表 */
+                    free(ver_token);
+                    result = entry->meta;
+                    pthread_rwlock_unlock(&current_dir->lock);
+                    break;
+                }
+
+                file_metadata_t *vmeta = version_manager_get_version_meta(entry->meta, ver_token);
+                free(ver_token);
+                result = vmeta;
+                pthread_rwlock_unlock(&current_dir->lock);
+                break;
+            }
+
+            /* 常规路径，直接返回 */
             result = entry->meta;
             pthread_rwlock_unlock(&current_dir->lock);
             break;
         }
+
+        free(ver_token);
 
         // 需要继续向下，但目标不是目录，失败
         if (entry->meta->type != FT_DIRECTORY)
@@ -767,6 +812,8 @@ block_map_t *create_block_map(uint64_t file_ino)
     map->blocks = NULL;
     map->direct_blocks = 12; // 默认12个直接块
     map->indirect_blocks = 0;
+    map->version_block_ids = NULL;
+    map->version_block_capacity = 0;
     pthread_rwlock_init(&map->lock, NULL);
 
     return map;
