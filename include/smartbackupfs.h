@@ -47,6 +47,7 @@ typedef struct {
     uint64_t latest_version_id; // 最新版本ID（模块B维护）
     time_t last_version_time; // 最近一次创建版本的时间戳
     bool version_pinned;    // 是否标记为重要版本，清理时跳过
+    void *version_handle;   // 指向版本节点的句柄（仅FT_VERSIONED有效）
     uint64_t parent_ino;    // 父目录inode
     char *xattr;           // 扩展属性
     size_t xattr_size;     // 扩展属性大小
@@ -121,6 +122,9 @@ typedef struct {
     uint32_t version_time_interval; /* 定时创建版本的时间间隔（秒） */
     uint32_t version_retention_count; /* 保留最近版本数量 */
     uint32_t version_retention_days; /* 保留版本的天数 */
+    uint32_t version_max_versions; /* 自动清理的最大保留版本数 */
+    uint32_t version_expire_days; /* 自动清理的过期天数 */
+    uint32_t version_clean_interval; /* 清理线程的轮询间隔（秒） */
 } fs_state_t;
 
 // 哈希表结构定义

@@ -40,9 +40,9 @@ fi
 
 echo "构建类型: ${BUILD_TYPE}"
 
-# 运行CMake
+# 运行CMake（使用相对路径）
 cd "${BUILD_DIR}"
-cmake "${PROJECT_DIR}" \
+cmake .. \
     -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
     -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
     -Wno-dev

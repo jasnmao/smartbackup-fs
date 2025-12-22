@@ -7,7 +7,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${SCRIPT_DIR}/.."
 BUILD_DIR="${PROJECT_DIR}/build"
-EXECUTABLE="${BUILD_DIR}/bin/smartbackup-fs"
+EXECUTABLE="./build/bin/smartbackup-fs"
 MOUNT_POINT="/tmp/smartbackup"
 
 # 检查可执行文件

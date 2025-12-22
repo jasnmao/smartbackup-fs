@@ -113,6 +113,35 @@ static int smartbackupfs_getattr(const char *path, struct stat *stbuf,
 
     memset(stbuf, 0, sizeof(struct stat));
 
+    // 检查是否是 @versions 路径
+    if (strstr(path, "@versions") != NULL)
+    {
+        // 解析基础路径（去掉@versions部分）
+        char *path_copy = strdup(path);
+        char *at = strrchr(path_copy, '@');
+        if (at)
+            *at = '\0';
+
+        file_metadata_t *base = lookup_path(path_copy);
+        free(path_copy);
+        
+        if (!base)
+            return -ENOENT;
+
+        // @versions 作为虚拟目录返回
+        stbuf->st_ino = base->ino + 1000000; // 使用特殊的inode编号
+        stbuf->st_mode = S_IFDIR | 0755;
+        stbuf->st_nlink = 2;
+        stbuf->st_uid = base->uid;
+        stbuf->st_gid = base->gid;
+        stbuf->st_size = 4096;
+        stbuf->st_blocks = 8;
+        clock_gettime(CLOCK_REALTIME, &stbuf->st_atim);
+        stbuf->st_mtim = stbuf->st_atim;
+        stbuf->st_ctim = stbuf->st_atim;
+        return 0;
+    }
+
     file_metadata_t *meta = lookup_path(path);
     if (!meta)
     {
@@ -248,6 +277,7 @@ static int smartbackupfs_unlink(const char *path)
             // 如果链接计数为0，才真正删除文件数据和元数据
             if (to_delete->meta->nlink == 0)
             {
+                blkcnt_t blk = to_delete->meta->blocks;
                 // 清理文件数据块映射
                 block_map_t *map = get_block_map(to_delete->meta->ino);
                 if (map)
@@ -272,7 +302,7 @@ static int smartbackupfs_unlink(const char *path)
 
                 free(to_delete->meta);
                 fs_state.total_files--;
-                fs_state.total_blocks -= to_delete->meta->blocks;
+                fs_state.total_blocks -= blk;
             }
 
             free(to_delete->name);
@@ -577,6 +607,11 @@ static int smartbackupfs_read(const char *path, char *buf, size_t size,
     if (S_ISDIR(meta->mode))
     {
         return -EISDIR;
+    }
+
+    if (meta->type == FT_VERSIONED)
+    {
+        return version_manager_read_version_data(meta, buf, size, offset);
     }
 
     // 使用高性能读取函数
@@ -959,24 +994,20 @@ static int smartbackupfs_readlink(const char *path, char *buf, size_t size)
     }
 
     size_t target_len = strlen(meta->xattr);
-    if (size == 0)
+    if (size > 0)
     {
-        return target_len;
+        size_t copy_len = (target_len < size) ? target_len : size - 1;
+        if (copy_len > 0)
+        {
+            memcpy(buf, meta->xattr, copy_len);
+        }
+        // 如果缓冲区足够大，添加null终止符（FUSE要求）
+        if (copy_len < size)
+        {
+            buf[copy_len] = '\0';
+        }
     }
-
-    size_t copy_len = (target_len < size) ? target_len : size - 1;
-    if (copy_len > 0)
-    {
-        memcpy(buf, meta->xattr, copy_len);
-    }
-
-    // 如果缓冲区足够大，添加null终止符（FUSE要求）
-    if (copy_len < size)
-    {
-        buf[copy_len] = '\0';
-    }
-
-    return copy_len;
+    return 0;
 }
 
 // 创建硬链接
@@ -1136,6 +1167,42 @@ static int smartbackupfs_setxattr(const char *path, const char *name,
         return 0;
     }
 
+    if (strcmp(name, "user.version.delete") == 0)
+    {
+        if (!value || size == 0)
+            return -EINVAL;
+        char buf[32] = {0};
+        size_t copy = size < sizeof(buf) ? size : sizeof(buf) - 1;
+        memcpy(buf, value, copy);
+        char *vstr = buf;
+        if (vstr[0] == 'v')
+            vstr++;
+        uint64_t vid = strtoull(vstr, NULL, 10);
+        if (vid == 0)
+            return -EINVAL;
+        int r = version_manager_delete_version(meta->ino, vid);
+        clock_gettime(CLOCK_REALTIME, &meta->ctime);
+        return r;
+    }
+
+    if (strcmp(name, "user.version.important") == 0)
+    {
+        if (!value || size == 0)
+            return -EINVAL;
+        char buf[32] = {0};
+        size_t copy = size < sizeof(buf) ? size : sizeof(buf) - 1;
+        memcpy(buf, value, copy);
+        char *vstr = buf;
+        if (vstr[0] == 'v')
+            vstr++;
+        uint64_t vid = strtoull(vstr, NULL, 10);
+        if (vid == 0)
+            return -EINVAL;
+        int r = version_manager_mark_important(meta->ino, vid, true);
+        clock_gettime(CLOCK_REALTIME, &meta->ctime);
+        return r;
+    }
+
     return -ENOTSUP;
 }
 
@@ -1148,9 +1215,9 @@ static int smartbackupfs_listxattr(const char *path, char *list, size_t size)
         return -ENOENT;
     }
 
-    const char *attrs[] = {"user.comment", "user.version.pinned", "user.version.create"};
-    size_t lens[3] = {strlen(attrs[0]) + 1, strlen(attrs[1]) + 1, strlen(attrs[2]) + 1};
-    size_t total_size = lens[0] + lens[1] + lens[2];
+    const char *attrs[] = {"user.comment", "user.version.pinned", "user.version.create", "user.version.delete", "user.version.important"};
+    size_t lens[5] = {strlen(attrs[0]) + 1, strlen(attrs[1]) + 1, strlen(attrs[2]) + 1, strlen(attrs[3]) + 1, strlen(attrs[4]) + 1};
+    size_t total_size = lens[0] + lens[1] + lens[2] + lens[3] + lens[4];
 
     if (size == 0)
         return total_size;
@@ -1163,6 +1230,10 @@ static int smartbackupfs_listxattr(const char *path, char *list, size_t size)
     memcpy(p, attrs[1], lens[1]);
     p += lens[1];
     memcpy(p, attrs[2], lens[2]);
+    p += lens[2];
+    memcpy(p, attrs[3], lens[3]);
+    p += lens[3];
+    memcpy(p, attrs[4], lens[4]);
 
     return total_size;
 }
@@ -1192,6 +1263,15 @@ static int smartbackupfs_removexattr(const char *path, const char *name)
     if (strcmp(name, "user.version.pinned") == 0)
     {
         meta->version_pinned = false;
+        clock_gettime(CLOCK_REALTIME, &meta->ctime);
+        return 0;
+    }
+
+    if (strcmp(name, "user.version.important") == 0)
+    {
+        /* 默认针对最新版本取消重要标记 */
+        if (meta->latest_version_id)
+            version_manager_mark_important(meta->ino, meta->latest_version_id, false);
         clock_gettime(CLOCK_REALTIME, &meta->ctime);
         return 0;
     }
@@ -1265,7 +1345,7 @@ int main(int argc, char *argv[])
     // 初始化文件系统
     fs_init();
 
-    printf("智能备份文件系统 v3.0\n");
+    printf("智能备份文件系统 v4.0\n");
     printf("支持的功能：\n");
     printf("  - 完整的POSIX文件操作\n");
     printf("  - 大文件支持（最大16TB）\n");
@@ -1274,9 +1354,10 @@ int main(int argc, char *argv[])
     printf("  - 透明版本管理：rename/unlink 事件前自动快照\n");
     printf("  - 变化感知版本：写入后块级差异 >10%% 自动建版\n");
     printf("  - 周期版本：后台线程按 version_time_interval 定期创建\n");
-    printf("  - 手动快照：xattr user.version.create 触发，支持 pinned 跳过清理\n");
-    printf("  - 版本访问：filename@vN / @latest / 时间表达式（2h/1d/yesterday）\n");
+    printf("  - 手动管理：xattr user.version.create/delete/important，pinned 跳过清理\n");
+    printf("  - 版本访问：filename@vN / @latest / 时间表达式（s/h/d/w/today/yesterday）\n");
     printf("  - 版本列表：filename@versions 列出历史版本\n");
+    printf("  - 版本清理：按 max_versions/expire_days 清理，重要版本跳过\n");
 
     return fuse_main(argc, argv, &smartbackupfs_ops, NULL);
 }

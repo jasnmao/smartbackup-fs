@@ -25,6 +25,7 @@ lru_cache_t *lru_cache_create(size_t max_size);
 void lru_cache_destroy(lru_cache_t *cache);
 int lru_cache_put(lru_cache_t *cache, uint64_t key, void *value);
 void *lru_cache_get(lru_cache_t *cache, uint64_t key);
+int lru_cache_remove(lru_cache_t *cache, uint64_t key);
 
 block_map_t *get_block_map(uint64_t file_ino);
 file_metadata_t *lookup_inode(uint64_t ino);
@@ -78,7 +79,24 @@ time_t version_manager_parse_time_expr(const char *expr)
     if (len == 0)
         return 0;
     if (strcmp(expr, "yesterday") == 0)
-        return now - 24 * 3600;
+    {
+        struct tm tmv;
+        localtime_r(&now, &tmv);
+        tmv.tm_mday -= 1;
+        tmv.tm_hour = 0;
+        tmv.tm_min = 0;
+        tmv.tm_sec = 0;
+        return mktime(&tmv);
+    }
+    if (strcmp(expr, "today") == 0)
+    {
+        struct tm tmv;
+        localtime_r(&now, &tmv);
+        tmv.tm_hour = 0;
+        tmv.tm_min = 0;
+        tmv.tm_sec = 0;
+        return mktime(&tmv);
+    }
     char unit = expr[len - 1];
     char buf[32] = {0};
     if (len - 1 < sizeof(buf))
@@ -86,10 +104,14 @@ time_t version_manager_parse_time_expr(const char *expr)
     long val = strtol(buf, NULL, 10);
     if (val <= 0)
         return 0;
+    if (unit == 's')
+        return now - val;
     if (unit == 'h')
         return now - val * 3600;
     if (unit == 'd')
         return now - val * 24 * 3600;
+    if (unit == 'w')
+        return now - val * 7 * 24 * 3600;
     return 0;
 }
 
@@ -112,6 +134,12 @@ int version_manager_init(void)
         fs_state.version_retention_count = 10;
     if (fs_state.version_retention_days == 0)
         fs_state.version_retention_days = 30;
+    if (fs_state.version_max_versions == 0)
+        fs_state.version_max_versions = fs_state.version_retention_count;
+    if (fs_state.version_expire_days == 0)
+        fs_state.version_expire_days = fs_state.version_retention_days;
+    if (fs_state.version_clean_interval == 0)
+        fs_state.version_clean_interval = fs_state.version_time_interval;
 
     return 0;
 }
@@ -139,6 +167,12 @@ void version_manager_destroy(void)
                 while (vn)
                 {
                     version_node_t *next = vn->next;
+                    if (vn->snapshots)
+                    {
+                        for (size_t i = 0; i < vn->snapshot_count; i++)
+                            free(vn->snapshots[i].data);
+                        free(vn->snapshots);
+                    }
                     free(vn->diff_blocks);
                     free(vn->block_checksums);
                     free(vn);
@@ -187,16 +221,28 @@ int version_manager_create_version(file_metadata_t *meta, const char *reason)
     vn->parent_version = chain->head ? chain->head->version_id : 0;
     vn->create_time = time(NULL);
 
-    /* 记录当前块校验和快照（滚动哈希） */
+    /* 记录当前块校验和与数据快照 */
     pthread_rwlock_rdlock(&map->lock);
     vn->block_count = map->block_count;
+    vn->snapshot_count = map->block_count;
+    vn->file_size = meta->size;
+    vn->blocks = meta->blocks;
     if (vn->block_count)
     {
         vn->block_checksums = calloc(vn->block_count, sizeof(uint32_t));
+        vn->snapshots = calloc(vn->block_count, sizeof(version_block_snapshot_t));
         if (!vn->block_checksums)
         {
             pthread_rwlock_unlock(&map->lock);
             pthread_rwlock_unlock(&chain->lock);
+            free(vn);
+            return -ENOMEM;
+        }
+        if (!vn->snapshots)
+        {
+            pthread_rwlock_unlock(&map->lock);
+            pthread_rwlock_unlock(&chain->lock);
+            free(vn->block_checksums);
             free(vn);
             return -ENOMEM;
         }
@@ -205,9 +251,19 @@ int version_manager_create_version(file_metadata_t *meta, const char *reason)
         {
             data_block_t *b = map->blocks[i];
             if (b && b->data)
+            {
                 vn->block_checksums[i] = rolling_checksum(b->data, b->size);
+                vn->snapshots[i].size = b->size;
+                vn->snapshots[i].data = malloc(b->size);
+                if (vn->snapshots[i].data)
+                    memcpy(vn->snapshots[i].data, b->data, b->size);
+            }
             else
+            {
                 vn->block_checksums[i] = 0;
+                vn->snapshots[i].size = 0;
+                vn->snapshots[i].data = NULL;
+            }
         }
     }
     pthread_rwlock_unlock(&map->lock);
@@ -220,6 +276,12 @@ int version_manager_create_version(file_metadata_t *meta, const char *reason)
         if (!vn->diff_blocks)
         {
             free(vn->block_checksums);
+            if (vn->snapshots)
+            {
+                for (size_t i = 0; i < vn->snapshot_count; i++)
+                    free(vn->snapshots[i].data);
+                free(vn->snapshots);
+            }
             pthread_rwlock_unlock(&chain->lock);
             free(vn);
             return -ENOMEM;
@@ -271,6 +333,7 @@ int version_manager_create_version(file_metadata_t *meta, const char *reason)
         vmeta->type = FT_VERSIONED;
         /* 组合key：高32位为ino，低32位为version_id */
         uint64_t key = (meta->ino << 32) | (vn->version_id & 0xffffffffULL);
+        vmeta->version_handle = vn;
         lru_cache_put(fs_state.version_cache, key, vmeta);
     }
 
@@ -384,7 +447,7 @@ file_metadata_t *version_manager_get_version_meta(file_metadata_t *meta, const c
         vn = vn->next;
     }
 
-    if (!vn && target_time)
+    if (!vn && best_time)
         vn = best_time;
 
     if (!vn)
@@ -416,6 +479,9 @@ file_metadata_t *version_manager_get_version_meta(file_metadata_t *meta, const c
     memcpy(vmeta, meta, sizeof(file_metadata_t));
     vmeta->type = FT_VERSIONED;
     vmeta->version = (uint32_t)vn->version_id;
+    vmeta->size = vn->file_size;
+    vmeta->blocks = vn->blocks;
+    vmeta->version_handle = vn;
     /* 不改变 ino，使得读取流程简化（真实实现可分配独立ino） */
 
     /* 缓存版本元数据 */
@@ -463,6 +529,171 @@ int version_manager_list_versions(file_metadata_t *meta, char ***out_list, size_
     *out_list = list;
     *out_count = n;
     return 0;
+}
+
+uint64_t version_manager_get_version_by_time(uint64_t ino, time_t target_time)
+{
+    if (!target_time)
+        return 0;
+
+    version_chain_t *chain = hash_table_get(versions_by_file, ino);
+    if (!chain)
+        return 0;
+
+    pthread_rwlock_rdlock(&chain->lock);
+    version_node_t *vn = chain->head;
+    uint64_t best = 0;
+    time_t best_time = 0;
+    while (vn)
+    {
+        if (vn->create_time <= target_time && vn->create_time >= best_time)
+        {
+            best = vn->version_id;
+            best_time = vn->create_time;
+        }
+        vn = vn->next;
+    }
+    pthread_rwlock_unlock(&chain->lock);
+    return best;
+}
+
+int version_manager_read_version_data(file_metadata_t *vmeta, char *buf, size_t size, off_t offset)
+{
+    if (!vmeta || !buf || !vmeta->version_handle)
+        return -EINVAL;
+
+    version_node_t *vn = (version_node_t *)vmeta->version_handle;
+    size_t fsize = vn->file_size;
+    if (offset < 0 || (size_t)offset >= fsize)
+        return 0;
+    size_t remaining = fsize - offset;
+    if (size > remaining)
+        size = remaining;
+
+    size_t bytes_read = 0;
+    size_t current_offset = offset;
+    while (bytes_read < size)
+    {
+        uint64_t block_index = current_offset / fs_state.block_size;
+        size_t block_offset = current_offset % fs_state.block_size;
+        size_t bytes_to_read = fs_state.block_size - block_offset;
+        if (bytes_to_read > (size - bytes_read))
+            bytes_to_read = size - bytes_read;
+
+        if (block_index >= vn->snapshot_count || !vn->snapshots[block_index].data)
+        {
+            memset(buf + bytes_read, 0, bytes_to_read);
+        }
+        else
+        {
+            size_t avail = vn->snapshots[block_index].size;
+            if (block_offset >= avail)
+            {
+                memset(buf + bytes_read, 0, bytes_to_read);
+            }
+            else
+            {
+                size_t copy_len = bytes_to_read;
+                if (block_offset + copy_len > avail)
+                    copy_len = avail - block_offset;
+                memcpy(buf + bytes_read, vn->snapshots[block_index].data + block_offset, copy_len);
+                if (copy_len < bytes_to_read)
+                    memset(buf + bytes_read + copy_len, 0, bytes_to_read - copy_len);
+            }
+        }
+
+        bytes_read += bytes_to_read;
+        current_offset += bytes_to_read;
+    }
+
+    return (int)bytes_read;
+}
+
+int version_manager_delete_version(uint64_t ino, uint64_t version_id)
+{
+    if (!version_id)
+        return -EINVAL;
+
+    version_chain_t *chain = hash_table_get(versions_by_file, ino);
+    if (!chain)
+        return -ENOENT;
+
+    pthread_rwlock_wrlock(&chain->lock);
+    version_node_t *prev = NULL;
+    version_node_t *cur = chain->head;
+    while (cur)
+    {
+        if (cur->version_id == version_id)
+            break;
+        prev = cur;
+        cur = cur->next;
+    }
+
+    if (!cur)
+    {
+        pthread_rwlock_unlock(&chain->lock);
+        return -ENOENT;
+    }
+
+    if (cur->is_important)
+    {
+        pthread_rwlock_unlock(&chain->lock);
+        return -EPERM;
+    }
+
+    if (prev)
+        prev->next = cur->next;
+    else
+        chain->head = cur->next;
+
+    chain->count--;
+
+    for (size_t i = 0; i < cur->snapshot_count; i++)
+    {
+        free(cur->snapshots[i].data);
+    }
+    free(cur->snapshots);
+    free(cur->diff_blocks);
+    free(cur->block_checksums);
+    uint64_t key = (ino << 32) | (cur->version_id & 0xffffffffULL);
+    if (fs_state.version_cache)
+        lru_cache_remove(fs_state.version_cache, key);
+
+    file_metadata_t *meta = lookup_inode(ino);
+    if (meta)
+    {
+        if (meta->latest_version_id == cur->version_id)
+        {
+            meta->latest_version_id = chain->head ? chain->head->version_id : 0;
+        }
+        if (meta->version_count > 0)
+            meta->version_count--;
+    }
+
+    free(cur);
+    pthread_rwlock_unlock(&chain->lock);
+    return 0;
+}
+
+int version_manager_mark_important(uint64_t ino, uint64_t version_id, bool important)
+{
+    version_chain_t *chain = hash_table_get(versions_by_file, ino);
+    if (!chain)
+        return -ENOENT;
+    pthread_rwlock_wrlock(&chain->lock);
+    version_node_t *vn = chain->head;
+    while (vn)
+    {
+        if (vn->version_id == version_id)
+        {
+            vn->is_important = important;
+            pthread_rwlock_unlock(&chain->lock);
+            return 0;
+        }
+        vn = vn->next;
+    }
+    pthread_rwlock_unlock(&chain->lock);
+    return -ENOENT;
 }
 
 int version_manager_diff(file_metadata_t *meta, uint64_t v1, uint64_t v2, char **out_diff)
@@ -528,7 +759,6 @@ static void *version_cleaner_thread_fn(void *arg)
                 version_chain_t *chain = node->value;
                 if (chain)
                 {
-                    /* 若文件被 pinned，跳过清理与周期创建 */
                     file_metadata_t *meta = lookup_inode(chain->file_ino);
                     if (meta && meta->version_pinned)
                     {
@@ -536,22 +766,28 @@ static void *version_cleaner_thread_fn(void *arg)
                         continue;
                     }
 
-                    /* 周期性创建版本 */
                     if (meta)
                         version_manager_create_periodic(meta, "periodic");
 
                     pthread_rwlock_wrlock(&chain->lock);
-                    /* 保留策略：保留最近 N 个版本以及指定天数内的版本 */
-                    size_t keep = fs_state.version_retention_count;
+                    size_t keep = fs_state.version_max_versions ? fs_state.version_max_versions : fs_state.version_retention_count;
+                    uint32_t expire_days = fs_state.version_expire_days ? fs_state.version_expire_days : fs_state.version_retention_days;
                     version_node_t *prev = NULL;
                     version_node_t *cur = chain->head;
                     size_t idx = 0;
                     while (cur)
                     {
                         int remove = 0;
+                        if (cur->is_important)
+                        {
+                            prev = cur;
+                            cur = cur->next;
+                            idx++;
+                            continue;
+                        }
                         if (idx >= keep)
                         {
-                            if ((now - cur->create_time) > (time_t)(fs_state.version_retention_days * 24 * 3600))
+                            if ((now - cur->create_time) > (time_t)(expire_days * 24 * 3600))
                                 remove = 1;
                         }
 
@@ -563,9 +799,18 @@ static void *version_cleaner_thread_fn(void *arg)
                             else
                                 chain->head = cur->next;
                             cur = cur->next;
+                            for (size_t i = 0; i < del->snapshot_count; i++)
+                                free(del->snapshots[i].data);
+                            free(del->snapshots);
                             free(del->diff_blocks);
                             free(del->block_checksums);
-                            free(del);
+                            uint64_t key = (chain->file_ino << 32) | (del->version_id & 0xffffffffULL);
+                            if (fs_state.version_cache)
+                                lru_cache_remove(fs_state.version_cache, key);
+                            if (meta && meta->version_count > 0)
+                                meta->version_count--;
+                            if (meta && meta->latest_version_id == del->version_id)
+                                meta->latest_version_id = chain->head ? chain->head->version_id : 0;
                             chain->count--;
                         }
                         else
@@ -583,7 +828,7 @@ static void *version_cleaner_thread_fn(void *arg)
         pthread_mutex_unlock(&versions_mutex);
 
         /* 休眠一段时间后继续 */
-        sleep(fs_state.version_time_interval ? fs_state.version_time_interval : 3600);
+        sleep(fs_state.version_clean_interval ? fs_state.version_clean_interval : 3600);
     }
     return NULL;
 }
