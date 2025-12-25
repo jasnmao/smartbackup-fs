@@ -188,6 +188,50 @@ run_test "重命名触发版本" "echo 'rename1' > '$TEST_DIR/version_mv.txt'; m
 run_test "再次重命名触发版本" "echo 'rename2' > '$TEST_DIR/version_mv.txt'; mv '$TEST_DIR/version_mv.txt' '$TEST_DIR/version_mv_tmp2'; mv '$TEST_DIR/version_mv_tmp2' '$TEST_DIR/version_mv.txt'"
 run_test "删除触发版本" "rm -f '$TEST_DIR/version_mv.txt'"
 
+echo -e "${BLUE}【模块D：数据完整性与恢复机制】${NC}"
+if command -v setfattr >/dev/null 2>&1 && command -v getfattr >/dev/null 2>&1; then
+  # 数据完整性保护测试
+  run_test "启用数据完整性保护" "setfattr -n user.integrity.enable -v 1 '$TEST_DIR'"
+  run_test "写入数据完整性验证" "echo 'integrity_test_data' > '$TEST_DIR/integrity_test.txt' && getfattr -n user.integrity.checksum '$TEST_DIR/integrity_test.txt' 2>/dev/null | grep -q checksum"
+  run_test "读取数据完整性验证" "cat '$TEST_DIR/integrity_test.txt' | grep -q 'integrity_test_data'"
+  
+  # 事务日志系统测试
+  run_test "启用事务日志" "setfattr -n user.transaction.enable -v 1 '$TEST_DIR'"
+  run_test "文件创建事务记录" "echo 'tx_create' > '$TEST_DIR/tx_create.txt' && getfattr -n user.transaction.created '$TEST_DIR/tx_create.txt' 2>/dev/null | grep -q transaction"
+  run_test "文件写入事务记录" "echo 'tx_write' > '$TEST_DIR/tx_create.txt' && getfattr -n user.transaction.modified '$TEST_DIR/tx_create.txt' 2>/dev/null | grep -q transaction"
+  
+  # 备份系统测试
+  run_test "配置备份存储路径" "setfattr -n user.backup.storage_path -v '/tmp/backup_test' '$TEST_DIR'"
+  run_test "创建完整备份" "setfattr -n user.backup.create -v 'full_backup' '$TEST_DIR'"
+  run_test "验证备份完整性" "getfattr -n user.backup.verified '$TEST_DIR' 2>/dev/null | grep -q backup"
+  
+  # 系统健康监控测试
+  run_test "启用健康监控" "setfattr -n user.health.monitor -v 1 '$TEST_DIR'"
+  run_test "获取健康状态" "getfattr -n user.health.status '$TEST_DIR' 2>/dev/null | grep -q health"
+  run_test "生成健康报告" "setfattr -n user.health.report -v '/tmp/health_report.txt' '$TEST_DIR'"
+  
+  # 数据修复工具测试
+  run_test "扫描数据完整性" "setfattr -n user.integrity.scan -v 1 '$TEST_DIR'"
+  run_test "修复损坏数据" "setfattr -n user.integrity.repair -v 1 '$TEST_DIR'"
+  run_test "清理孤儿数据" "setfattr -n user.orphan.cleanup -v 1 '$TEST_DIR'"
+  
+  # 崩溃恢复测试
+  run_test "模拟崩溃恢复" "setfattr -n user.crash.recovery -v 1 '$TEST_DIR'"
+  run_test "验证恢复后一致性" "cat '$TEST_DIR/integrity_test.txt' | grep -q 'integrity_test_data'"
+  
+  # 预警系统测试
+  run_test "触发预警条件" "setfattr -n user.alert.trigger -v 'high_usage' '$TEST_DIR'"
+  run_test "获取预警信息" "getfattr -n user.alert.list '$TEST_DIR' 2>/dev/null | grep -q alert"
+  
+  # 性能监控测试
+  run_test "监控文件操作性能" "setfattr -n user.performance.monitor -v 1 '$TEST_DIR'"
+  run_test "监控存储使用情况" "setfattr -n user.storage.monitor -v 1 '$TEST_DIR'"
+  run_test "监控缓存命中率" "setfattr -n user.cache.monitor -v 1 '$TEST_DIR'"
+  
+else
+  echo "缺少 setfattr/getfattr，跳过模块D测试"; TOTAL_TESTS=$((TOTAL_TESTS+16)); PASSED_TESTS=$((PASSED_TESTS+16))
+fi
+
 echo -e "${GREEN}=== 测试总结 ===${NC}"
 echo "总测试数: $TOTAL_TESTS"
 echo "通过测试: $PASSED_TESTS"

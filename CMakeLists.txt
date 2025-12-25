@@ -50,6 +50,8 @@ set(SMARTBACKUPFS_SOURCES
     src/module_c/module_d_adapter.c
     src/module_c/monitor.c
     src/module_c/compression.c
+    src/module_d/module_d.c
+    src/module_d/module_d_integration.c
 )
 
 set(SMARTBACKUPFS_HEADERS
@@ -66,6 +68,8 @@ set(SMARTBACKUPFS_HEADERS
     include/module_c/module_d_adapter.h
     include/module_c.h
     include/module_c/compression.h
+    include/module_d.h
+    include/module_d_integration.h
 )
 
 # 可执行文件
