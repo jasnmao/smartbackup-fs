@@ -72,6 +72,20 @@ typedef struct transaction_entry {
     struct transaction_entry *next;
 } transaction_entry_t;
 
+// 事务头部结构
+#pragma pack(push, 1)
+typedef struct transaction_header {
+    uint64_t tx_id;
+    transaction_type_t type;
+    transaction_state_t state;
+    time_t timestamp;
+    uint64_t ino;
+    uint64_t block_id;
+    size_t data_size;
+    uint32_t checksum;
+} transaction_header_t;
+#pragma pack(pop)
+
 // WAL段结构
 typedef struct wal_segment {
     uint64_t segment_id;
@@ -80,6 +94,7 @@ typedef struct wal_segment {
     size_t capacity;
     time_t created_time;
     bool active;
+    bool file_written;
     struct wal_segment *next;
 } wal_segment_t;
 
@@ -295,6 +310,16 @@ int md_backup_init(const char *storage_path);
 void md_backup_destroy(void);
 
 /**
+ * 设置备份存储路径
+ */
+int md_set_backup_storage_path(const char *storage_path);
+
+/**
+ * 创建备份
+ */
+int md_create_backup(const char *description);
+
+/**
  * 创建完整备份
  */
 uint64_t md_create_full_backup(const char *description);
@@ -392,5 +417,29 @@ int md_rebuild_indexes(void);
  * 修复工具：清理孤儿数据
  */
 int md_cleanup_orphaned_data(void);
+
+// ================================
+// 模块D初始化函数
+// ================================
+
+/**
+ * 初始化模块D
+ */
+int module_d_init(void);
+
+/**
+ * 销毁模块D
+ */
+void module_d_destroy(void);
+
+/**
+ * 设置备份存储路径
+ */
+int md_set_backup_storage_path(const char *storage_path);
+
+/**
+ * 创建备份
+ */
+int md_create_backup(const char *description);
 
 #endif // MODULE_D_H

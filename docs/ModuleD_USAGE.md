@@ -326,7 +326,7 @@ if (custom_condition) {
 # 启用数据完整性保护
 setfattr -n user.integrity.enable -v 1 /挂载点/测试目录
 
-# 创建测试文件并写入数据
+# 创建测试文件s并写入数据
 echo "测试数据内容" > /挂载点/测试目录/integrity_test.txt
 
 # 获取完整性校验和

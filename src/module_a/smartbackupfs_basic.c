@@ -325,6 +325,24 @@ static int smartbackupfs_unlink(const char *path)
             // 在删除前创建版本快照（事件触发策略）
             version_manager_create_version(to_delete->meta, "unlink");
 
+            // 记录文件删除事务
+            if (module_d_state.wal_enabled) {
+                uint64_t tx_id = md_transaction_begin(TX_DELETE_FILE);
+                transaction_header_t header;
+                header.tx_id = tx_id;
+                header.type = TX_DELETE_FILE;
+                header.state = TX_COMMITTED;
+                header.timestamp = time(NULL);
+                header.ino = to_delete->meta->ino;
+                header.block_id = 0;
+                header.data_size = strlen(path) + 1;
+                header.checksum = 0;
+                md_transaction_log(tx_id, &header, sizeof(header));
+                md_transaction_log(tx_id, path, strlen(path) + 1);
+                md_transaction_commit(tx_id);
+                printf("模块D：记录文件删除事务 %lu，文件: %s\n", tx_id, path);
+            }
+
             // 从链表中删除
             *entry_ptr = to_delete->next;
 
@@ -699,6 +717,24 @@ static int smartbackupfs_write(const char *path, const char *buf, size_t size,
     {
         /* 变化策略：块级差异 >10% 触发版本 */
         version_manager_maybe_change_snapshot(meta);
+        
+        // 记录文件写入事务
+        if (module_d_state.wal_enabled) {
+            uint64_t tx_id = md_transaction_begin(TX_WRITE_DATA);
+            transaction_header_t header;
+            header.tx_id = tx_id;
+            header.type = TX_WRITE_DATA;
+            header.state = TX_COMMITTED;
+            header.timestamp = time(NULL);
+            header.ino = meta->ino;
+            header.block_id = (uint64_t)(offset / 4096); // 计算块ID
+            header.data_size = size;
+            header.checksum = 0;
+            md_transaction_log(tx_id, &header, sizeof(header));
+            md_transaction_log(tx_id, buf, size > 1024 ? 1024 : size); // 记录前1KB数据
+            md_transaction_commit(tx_id);
+            printf("模块D：记录文件写入事务 %lu，文件: %s，大小: %zu\n", tx_id, path, size);
+        }
     }
     return ret;
 }
@@ -899,6 +935,24 @@ static int smartbackupfs_create(const char *path, mode_t mode,
     cache_set(new_file->ino, new_file);
 
     fs_state.total_files++;
+
+        // 记录文件创建事务
+        if (module_d_state.wal_enabled) {
+            uint64_t tx_id = md_transaction_begin(TX_CREATE_FILE);
+            transaction_header_t header;
+            header.tx_id = tx_id;
+            header.type = TX_CREATE_FILE;
+            header.state = TX_COMMITTED;
+            header.timestamp = time(NULL);
+            header.ino = new_file->ino;
+            header.block_id = 0;
+            header.data_size = strlen(path) + 1;
+            header.checksum = 0;
+            md_transaction_log(tx_id, &header, sizeof(header));
+            md_transaction_log(tx_id, path, strlen(path) + 1);
+            md_transaction_commit(tx_id);
+            printf("模块D：记录文件创建事务 %lu，文件: %s\n", tx_id, path);
+        }
 
     // 设置文件描述符
     if (fi)
@@ -1593,7 +1647,17 @@ static int smartbackupfs_setxattr(const char *path, const char *name,
         bool enable = true;
         if (value && size > 0)
             enable = !(value[0] == '0');
+        
+        // 实际启用/禁用事务日志系统
+        module_d_state.wal_enabled = enable;
         printf("模块D：事务日志系统 %s\n", enable ? "已启用" : "已禁用");
+        
+        if (enable) {
+            // 如果启用，记录一个事务开始
+            uint64_t tx_id = md_transaction_begin(TX_METADATA_UPDATE);
+            printf("事务日志已启用，开始事务 %lu\n", tx_id);
+        }
+        
         clock_gettime(CLOCK_REALTIME, &meta->ctime);
         return 0;
     }
@@ -1605,6 +1669,14 @@ static int smartbackupfs_setxattr(const char *path, const char *name,
         size_t copy = size < sizeof(tmp) ? size : sizeof(tmp) - 1;
         memcpy(tmp, value, copy);
         printf("模块D：备份存储路径设置为 %s\n", tmp);
+        
+        // 实际设置备份存储路径
+        if (md_set_backup_storage_path(tmp) == 0) {
+            printf("备份存储路径设置成功\n");
+        } else {
+            printf("备份存储路径设置失败\n");
+        }
+        
         clock_gettime(CLOCK_REALTIME, &meta->ctime);
         return 0;
     }
@@ -1615,6 +1687,14 @@ static int smartbackupfs_setxattr(const char *path, const char *name,
         size_t copy = size < sizeof(tmp) ? size : sizeof(tmp) - 1;
         memcpy(tmp, value, copy);
         printf("模块D：创建备份 - %s\n", tmp);
+        
+        // 实际创建备份
+        if (md_create_backup(tmp) == 0) {
+            printf("备份创建成功: %s\n", tmp);
+        } else {
+            printf("备份创建失败\n");
+        }
+        
         clock_gettime(CLOCK_REALTIME, &meta->ctime);
         return 0;
     }
@@ -1950,6 +2030,13 @@ int main(int argc, char *argv[])
     // 初始化文件系统
     fs_init();
 
+    // 初始化模块D：数据完整性与恢复机制
+    if (module_d_init() != 0) {
+        printf("警告：模块D初始化失败，数据完整性与恢复功能将不可用\n");
+    } else {
+        printf("模块D：数据完整性与恢复机制已初始化\n");
+    }
+
     printf("智能备份文件系统 v6.0\n");
     printf("支持的功能：\n");
     printf("  - 完整的POSIX文件操作，最大16TB，线程安全并发访问\n");
@@ -1965,6 +2052,7 @@ int main(int argc, char *argv[])
     printf("  - 多级缓存：L1 内存 + L2 文件缓存 + L3 目录缓存，写入级联失效\n");
     printf("  - 缓存/存储监控：命中率、压缩/去重输入字节与移除计数\n");
     printf("  - 并发一致性：version_lock + block_index + 引用计数协同\n");
+    printf("  - 模块D：数据完整性保护、事务日志系统、备份恢复工具、系统健康监控\n");
 
     return fuse_main(argc, argv, &smartbackupfs_ops, NULL);
 }

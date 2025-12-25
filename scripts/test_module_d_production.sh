@@ -31,6 +31,7 @@ run_test() {
 }
 
 ensure_mount() {
+    PID=0
     if mountpoint -q "$MOUNT_POINT"; then
         log "检测到已挂载：$MOUNT_POINT"
         return
