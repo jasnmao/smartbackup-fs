@@ -26,7 +26,7 @@ typedef struct hash_node {
 } hash_node_t;
 
 // 哈希表结构
-typedef struct {
+typedef struct hash_table {
     hash_node_t **buckets;
     size_t size;
     size_t count;
@@ -62,6 +62,7 @@ void lru_cache_clear(lru_cache_t *cache);
 block_map_t *create_block_map(uint64_t file_ino);
 void destroy_block_map(block_map_t *map);
 block_map_t *get_block_map(uint64_t file_ino);
+int block_map_diff(block_map_t *old_map, block_map_t *new_map, hash_table_t *diff_blocks);
 
 // 高性能文件操作
 int smart_read_file(file_metadata_t *meta, char *buf, size_t size, off_t offset);

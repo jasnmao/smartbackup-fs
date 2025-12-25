@@ -7,6 +7,9 @@
 
 #include "version_manager.h"
 #include "smartbackupfs.h"
+#include "dedup.h"
+#include "module_c/cache.h"
+#include "module_c/storage_prediction.h"
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +38,91 @@ static hash_table_t *versions_by_file = NULL; /* key: file_ino -> value: version
 static pthread_mutex_t versions_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int cleaner_running = 0;
 
+
+/* 向前声明：用于父子版本间的数据继承解析 */
+static int snapshot_get_block_data(const version_node_t *vn, uint64_t block_index, const char **data, size_t *size);
+
+/* 从链表中移除并释放一个版本节点（调用方持有 chain->lock） */
+static version_node_t *version_remove_node_locked(version_chain_t *chain, version_node_t *del, file_metadata_t *meta, uint64_t *added_bytes)
+{
+    if (!chain || !del)
+        return NULL;
+
+    version_node_t *prev = del->prev;
+    version_node_t *next = del->next;
+
+    if (prev)
+        prev->next = next;
+    else
+        chain->head = next;
+
+    if (next)
+        next->prev = prev;
+    else
+        chain->tail = prev;
+
+    /* 修正仍在链上的子版本：补齐继承的数据并重定向父指针 */
+    uint64_t newly_materialized = 0;
+    for (version_node_t *iter = chain->head; iter; iter = iter->next)
+    {
+        if (iter->parent == del)
+        {
+            for (size_t i = 0; i < iter->snapshot_count; i++)
+            {
+                if (iter->snapshots[i].has_data)
+                    continue;
+                const char *data = NULL;
+                size_t sz = 0;
+                if (snapshot_get_block_data(del, i, &data, &sz) == 0 && data && sz > 0)
+                {
+                    char *copy = malloc(sz);
+                    if (copy)
+                    {
+                        memcpy(copy, data, sz);
+                        iter->snapshots[i].data = copy;
+                        iter->snapshots[i].size = sz;
+                        iter->snapshots[i].has_data = true;
+                        iter->stored_bytes += sz;
+                        newly_materialized += sz;
+                    }
+                }
+            }
+            iter->parent = del->parent;
+            iter->parent_id = del->parent ? del->parent->version_id : 0;
+        }
+    }
+
+    for (size_t i = 0; i < del->snapshot_count; i++)
+    {
+        if (del->snapshots[i].has_data)
+            free(del->snapshots[i].data);
+    }
+    free(del->snapshots);
+    free(del->diff_blocks);
+    free(del->block_checksums);
+    if (del->description)
+        free(del->description);
+
+    uint64_t key = (chain->file_ino << 32) | (del->version_id & 0xffffffffULL);
+    if (fs_state.version_cache)
+        lru_cache_remove(fs_state.version_cache, key);
+
+    if (meta)
+    {
+        if (meta->version_count > 0)
+            meta->version_count--;
+        if (meta->latest_version_id == del->version_id)
+            meta->latest_version_id = chain->head ? chain->head->version_id : 0;
+    }
+
+    if (added_bytes)
+        *added_bytes += newly_materialized;
+
+    free(del);
+    chain->count--;
+    return prev;
+}
+
 /* 简单滚动哈希（多项式）用于块级变化检测 */
 static uint32_t rolling_checksum(const char *data, size_t size)
 {
@@ -47,6 +135,77 @@ static uint32_t rolling_checksum(const char *data, size_t size)
         hash ^= ((hash << 5) + (uint8_t)data[i] + (hash >> 2)) + base;
     }
     return hash;
+}
+
+/* 递归/迭代获取块快照数据：如果当前版本未持有数据，则向父版本继承 */
+static int snapshot_get_block_data(const version_node_t *vn, uint64_t block_index, const char **data, size_t *size)
+{
+    const version_node_t *cur = vn;
+    while (cur)
+    {
+        if (block_index < cur->snapshot_count)
+        {
+            const version_block_snapshot_t *snap = &cur->snapshots[block_index];
+            if (snap->has_data && snap->data)
+            {
+                if (data)
+                    *data = snap->data;
+                if (size)
+                    *size = snap->size;
+                return 0;
+            }
+        }
+        cur = cur->parent;
+    }
+    return -ENOENT;
+}
+
+/* 在持有 chain->lock 的情况下执行保留策略（数量/时间/容量） */
+static void version_apply_retention_locked(version_chain_t *chain, file_metadata_t *meta, time_t now)
+{
+    if (!chain)
+        return;
+
+    if (meta && meta->version_pinned)
+        return;
+
+    size_t keep = fs_state.version_max_versions ? fs_state.version_max_versions : fs_state.version_retention_count;
+    uint32_t expire_days = fs_state.version_expire_days ? fs_state.version_expire_days : fs_state.version_retention_days;
+    uint64_t size_limit = fs_state.version_retention_size_mb ? (fs_state.version_retention_size_mb * 1024ULL * 1024ULL) : 0ULL;
+
+    /* 预计算总占用（仅增量存储的差异块大小） */
+    uint64_t total_bytes = 0;
+    for (version_node_t *cur = chain->head; cur; cur = cur->next)
+        total_bytes += cur->stored_bytes;
+
+    version_node_t *cur = chain->tail; /* 从最旧开始清理 */
+    while (cur)
+    {
+        if (cur->is_important)
+        {
+            cur = cur->prev;
+            continue;
+        }
+
+        int remove = 0;
+        if (chain->count > keep && (now - cur->create_time) > (time_t)(expire_days * 24 * 3600))
+            remove = 1;
+        if (!remove && size_limit && total_bytes > size_limit && chain->count > 1)
+            remove = 1;
+
+        if (remove)
+        {
+            version_node_t *prev = cur->prev;
+            total_bytes = (total_bytes > cur->stored_bytes) ? (total_bytes - cur->stored_bytes) : 0;
+            uint64_t added = 0;
+            version_remove_node_locked(chain, cur, meta, &added);
+            total_bytes += added;
+            cur = prev;
+            continue;
+        }
+
+        cur = cur->prev;
+    }
 }
 
 /* 内部帮助函数：查找或创建version_chain */
@@ -115,6 +274,46 @@ time_t version_manager_parse_time_expr(const char *expr)
     return 0;
 }
 
+size_t version_manager_collect_samples(version_history_sample_t *buf, size_t max_samples)
+{
+    if (!versions_by_file)
+        return 0;
+    size_t count = 0;
+
+    pthread_mutex_lock(&versions_mutex);
+    for (size_t i = 0; i < versions_by_file->size; i++)
+    {
+        hash_node_t *node = versions_by_file->buckets[i];
+        while (node)
+        {
+            version_chain_t *chain = node->value;
+            if (chain)
+            {
+                pthread_rwlock_rdlock(&chain->lock);
+                for (version_node_t *vn = chain->head; vn; vn = vn->next)
+                {
+                    if (buf && count < max_samples)
+                    {
+                        buf[count].create_time = vn->create_time;
+                        buf[count].file_size = vn->file_size;
+                    }
+                    count++;
+                    if (buf && count >= max_samples)
+                        break;
+                }
+                pthread_rwlock_unlock(&chain->lock);
+            }
+            if (buf && count >= max_samples)
+                break;
+            node = node->next;
+        }
+        if (buf && count >= max_samples)
+            break;
+    }
+    pthread_mutex_unlock(&versions_mutex);
+    return count;
+}
+
 int version_manager_init(void)
 {
     versions_by_file = hash_table_create(4096);
@@ -138,8 +337,14 @@ int version_manager_init(void)
         fs_state.version_max_versions = fs_state.version_retention_count;
     if (fs_state.version_expire_days == 0)
         fs_state.version_expire_days = fs_state.version_retention_days;
+    if (fs_state.version_retention_size_mb == 0)
+        fs_state.version_retention_size_mb = 1024; /* 默认 1GB 上限，可通过 xattr 调整 */
     if (fs_state.version_clean_interval == 0)
         fs_state.version_clean_interval = fs_state.version_time_interval;
+
+    /* 同步配置别名给模块C使用 */
+    fs_state.max_versions = fs_state.version_max_versions;
+    fs_state.expire_days = fs_state.version_expire_days;
 
     return 0;
 }
@@ -170,9 +375,14 @@ void version_manager_destroy(void)
                     if (vn->snapshots)
                     {
                         for (size_t i = 0; i < vn->snapshot_count; i++)
-                            free(vn->snapshots[i].data);
+                        {
+                            if (vn->snapshots[i].has_data)
+                                free(vn->snapshots[i].data);
+                        }
                         free(vn->snapshots);
                     }
+                    if (vn->description)
+                        free(vn->description);
                     free(vn->diff_blocks);
                     free(vn->block_checksums);
                     free(vn);
@@ -217,9 +427,14 @@ int version_manager_create_version(file_metadata_t *meta, const char *reason)
 
     /* 生成顺序版本号（每个文件内部递增） */
     pthread_rwlock_wrlock(&chain->lock);
-    vn->version_id = (uint64_t)(chain->count + 1);
-    vn->parent_version = chain->head ? chain->head->version_id : 0;
+    uint64_t next_vid = chain->head ? (chain->head->version_id + 1) : 1;
+    vn->version_id = next_vid;
+    vn->parent_id = chain->head ? chain->head->version_id : 0;
+    vn->parent = chain->head;
     vn->create_time = time(NULL);
+    vn->description = reason ? strdup(reason) : NULL;
+    vn->block_map = map;
+    map->version_id = vn->version_id;
 
     /* 记录当前块校验和与数据快照 */
     pthread_rwlock_rdlock(&map->lock);
@@ -231,18 +446,16 @@ int version_manager_create_version(file_metadata_t *meta, const char *reason)
     {
         vn->block_checksums = calloc(vn->block_count, sizeof(uint32_t));
         vn->snapshots = calloc(vn->block_count, sizeof(version_block_snapshot_t));
-        if (!vn->block_checksums)
-        {
-            pthread_rwlock_unlock(&map->lock);
-            pthread_rwlock_unlock(&chain->lock);
-            free(vn);
-            return -ENOMEM;
-        }
-        if (!vn->snapshots)
+        vn->diff_blocks = calloc(vn->block_count ? vn->block_count : 1, sizeof(uint64_t));
+        if (!vn->block_checksums || !vn->snapshots || !vn->diff_blocks)
         {
             pthread_rwlock_unlock(&map->lock);
             pthread_rwlock_unlock(&chain->lock);
             free(vn->block_checksums);
+            free(vn->snapshots);
+            free(vn->diff_blocks);
+            if (vn->description)
+                free(vn->description);
             free(vn);
             return -ENOMEM;
         }
@@ -250,81 +463,78 @@ int version_manager_create_version(file_metadata_t *meta, const char *reason)
         for (size_t i = 0; i < vn->block_count; i++)
         {
             data_block_t *b = map->blocks[i];
+            uint32_t prev = (vn->parent && i < vn->parent->block_count) ? vn->parent->block_checksums[i] : 0;
+            uint32_t cur = 0;
+            size_t plain_size = 0;
+            const char *plain = NULL;
+
             if (b && b->data)
             {
-                vn->block_checksums[i] = rolling_checksum(b->data, b->size);
-                vn->snapshots[i].size = b->size;
-                vn->snapshots[i].data = malloc(b->size);
-                if (vn->snapshots[i].data)
-                    memcpy(vn->snapshots[i].data, b->data, b->size);
+                char *owned = NULL;
+                plain_size = b->size;
+                plain = b->data;
+                if (b->compressed_size > 0 && b->compression != COMPRESSION_NONE)
+                {
+                    if (block_decompress(b, &owned, &plain_size) == 0 && owned)
+                        plain = owned;
+                    else
+                        plain_size = b->size;
+                }
+
+                cur = rolling_checksum(plain, plain_size);
+
+                if (cur != prev || !vn->parent)
+                {
+                    vn->snapshots[i].size = plain_size;
+                    vn->snapshots[i].data = malloc(plain_size);
+                    if (vn->snapshots[i].data)
+                    {
+                        memcpy(vn->snapshots[i].data, plain, plain_size);
+                        vn->snapshots[i].has_data = true;
+                        vn->stored_bytes += plain_size;
+                    }
+                    vn->diff_blocks[vn->diff_count++] = i;
+                }
+                else
+                {
+                    vn->snapshots[i].size = 0;
+                    vn->snapshots[i].data = NULL;
+                    vn->snapshots[i].has_data = false;
+                }
+
+                if (owned)
+                    free(owned);
             }
             else
             {
-                vn->block_checksums[i] = 0;
+                cur = 0;
                 vn->snapshots[i].size = 0;
                 vn->snapshots[i].data = NULL;
+                vn->snapshots[i].has_data = false;
             }
+
+            vn->block_checksums[i] = cur;
         }
     }
     pthread_rwlock_unlock(&map->lock);
 
-    /* 计算与父版本的差异块索引 */
-    if (vn->parent_version && chain->head && chain->head->block_checksums)
-    {
-        /* 最多记录全部块索引，实际会更小 */
-        vn->diff_blocks = calloc(vn->block_count ? vn->block_count : 1, sizeof(uint64_t));
-        if (!vn->diff_blocks)
-        {
-            free(vn->block_checksums);
-            if (vn->snapshots)
-            {
-                for (size_t i = 0; i < vn->snapshot_count; i++)
-                    free(vn->snapshots[i].data);
-                free(vn->snapshots);
-            }
-            pthread_rwlock_unlock(&chain->lock);
-            free(vn);
-            return -ENOMEM;
-        }
-
-        for (size_t i = 0; i < vn->block_count; i++)
-        {
-            uint32_t prev = 0;
-            if (i < chain->head->block_count)
-                prev = chain->head->block_checksums[i];
-            uint32_t cur = vn->block_checksums[i];
-            if (cur != prev)
-            {
-                vn->diff_blocks[vn->diff_count++] = i;
-            }
-        }
-    }
-    else
-    {
-        /* 没有父版本，全部视为diff */
-        if (vn->block_count)
-        {
-            vn->diff_blocks = calloc(vn->block_count, sizeof(uint64_t));
-            if (vn->diff_blocks)
-            {
-                for (size_t i = 0; i < vn->block_count; i++)
-                {
-                    vn->diff_blocks[vn->diff_count++] = i;
-                }
-            }
-        }
-    }
-
     /* 将新版本插入链表头部 */
     vn->next = chain->head;
+    vn->prev = NULL;
+    if (chain->head)
+        chain->head->prev = vn;
     chain->head = vn;
+    if (!chain->tail)
+        chain->tail = vn;
     chain->count++;
+
+    /* 即刻应用保留策略，避免后台清理延迟（含容量限制） */
+    version_apply_retention_locked(chain, meta, time(NULL));
 
     /* 更新文件元数据中的版本计数 */
     meta->version_count++;
     meta->latest_version_id = vn->version_id;
     meta->last_version_time = vn->create_time;
-
     /* 将版本元数据缓存到 fs_state.version_cache 以便快速访问 */
     file_metadata_t *vmeta = malloc(sizeof(file_metadata_t));
     if (vmeta)
@@ -338,6 +548,8 @@ int version_manager_create_version(file_metadata_t *meta, const char *reason)
     }
 
     pthread_rwlock_unlock(&chain->lock);
+
+    predict_storage_usage_internal(7, NULL);
 
     return 0;
 }
@@ -373,7 +585,23 @@ int version_manager_maybe_change_snapshot(file_metadata_t *meta)
     for (size_t i = 0; i < block_count; i++)
     {
         data_block_t *b = map->blocks[i];
-        uint32_t cur = (b && b->data) ? rolling_checksum(b->data, b->size) : 0;
+        uint32_t cur = 0;
+        if (b && b->data)
+        {
+            char *owned = NULL;
+            size_t plain_size = b->size;
+            const char *plain = b->data;
+            if (b->compressed_size > 0 && b->compression != COMPRESSION_NONE)
+            {
+                if (block_decompress(b, &owned, &plain_size) == 0 && owned)
+                    plain = owned;
+                else
+                    plain_size = b->size;
+            }
+            cur = rolling_checksum(plain, plain_size);
+            if (owned)
+                free(owned);
+        }
         uint32_t prev = (i < chain->head->block_count) ? chain->head->block_checksums[i] : 0;
         if (cur != prev)
             diffcnt++;
@@ -425,7 +653,7 @@ file_metadata_t *version_manager_get_version_meta(file_metadata_t *meta, const c
     {
         char *endptr = NULL;
         long v = strtol(verstr + 1, &endptr, 10);
-        if (endptr && *endptr == '\0' && v > 0)
+        if (v > 0)
             want = (uint64_t)v;
     }
     else
@@ -517,8 +745,13 @@ int version_manager_list_versions(file_metadata_t *meta, char ***out_list, size_
     size_t i = 0;
     while (vn && i < n)
     {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "v%llu", (unsigned long long)vn->version_id);
+        char buf[128];
+        char tbuf[32] = {0};
+        struct tm tmv;
+        localtime_r(&vn->create_time, &tmv);
+        strftime(tbuf, sizeof(tbuf), "%F %T", &tmv);
+        const char *desc = vn->description ? vn->description : "auto";
+        snprintf(buf, sizeof(buf), "v%llu | %s | %s", (unsigned long long)vn->version_id, tbuf, desc);
         list[i] = strdup(buf);
         i++;
         vn = vn->next;
@@ -580,26 +813,23 @@ int version_manager_read_version_data(file_metadata_t *vmeta, char *buf, size_t 
         if (bytes_to_read > (size - bytes_read))
             bytes_to_read = size - bytes_read;
 
-        if (block_index >= vn->snapshot_count || !vn->snapshots[block_index].data)
+        const char *blk = NULL;
+        size_t avail = 0;
+        if (block_index < vn->snapshot_count)
+            snapshot_get_block_data(vn, block_index, &blk, &avail);
+
+        if (!blk || block_offset >= avail)
         {
             memset(buf + bytes_read, 0, bytes_to_read);
         }
         else
         {
-            size_t avail = vn->snapshots[block_index].size;
-            if (block_offset >= avail)
-            {
-                memset(buf + bytes_read, 0, bytes_to_read);
-            }
-            else
-            {
-                size_t copy_len = bytes_to_read;
-                if (block_offset + copy_len > avail)
-                    copy_len = avail - block_offset;
-                memcpy(buf + bytes_read, vn->snapshots[block_index].data + block_offset, copy_len);
-                if (copy_len < bytes_to_read)
-                    memset(buf + bytes_read + copy_len, 0, bytes_to_read - copy_len);
-            }
+            size_t copy_len = bytes_to_read;
+            if (block_offset + copy_len > avail)
+                copy_len = avail - block_offset;
+            memcpy(buf + bytes_read, blk + block_offset, copy_len);
+            if (copy_len < bytes_to_read)
+                memset(buf + bytes_read + copy_len, 0, bytes_to_read - copy_len);
         }
 
         bytes_read += bytes_to_read;
@@ -619,13 +849,11 @@ int version_manager_delete_version(uint64_t ino, uint64_t version_id)
         return -ENOENT;
 
     pthread_rwlock_wrlock(&chain->lock);
-    version_node_t *prev = NULL;
     version_node_t *cur = chain->head;
     while (cur)
     {
         if (cur->version_id == version_id)
             break;
-        prev = cur;
         cur = cur->next;
     }
 
@@ -641,36 +869,8 @@ int version_manager_delete_version(uint64_t ino, uint64_t version_id)
         return -EPERM;
     }
 
-    if (prev)
-        prev->next = cur->next;
-    else
-        chain->head = cur->next;
-
-    chain->count--;
-
-    for (size_t i = 0; i < cur->snapshot_count; i++)
-    {
-        free(cur->snapshots[i].data);
-    }
-    free(cur->snapshots);
-    free(cur->diff_blocks);
-    free(cur->block_checksums);
-    uint64_t key = (ino << 32) | (cur->version_id & 0xffffffffULL);
-    if (fs_state.version_cache)
-        lru_cache_remove(fs_state.version_cache, key);
-
     file_metadata_t *meta = lookup_inode(ino);
-    if (meta)
-    {
-        if (meta->latest_version_id == cur->version_id)
-        {
-            meta->latest_version_id = chain->head ? chain->head->version_id : 0;
-        }
-        if (meta->version_count > 0)
-            meta->version_count--;
-    }
-
-    free(cur);
+    version_remove_node_locked(chain, cur, meta, NULL);
     pthread_rwlock_unlock(&chain->lock);
     return 0;
 }
@@ -770,62 +970,16 @@ static void *version_cleaner_thread_fn(void *arg)
                         version_manager_create_periodic(meta, "periodic");
 
                     pthread_rwlock_wrlock(&chain->lock);
-                    size_t keep = fs_state.version_max_versions ? fs_state.version_max_versions : fs_state.version_retention_count;
-                    uint32_t expire_days = fs_state.version_expire_days ? fs_state.version_expire_days : fs_state.version_retention_days;
-                    version_node_t *prev = NULL;
-                    version_node_t *cur = chain->head;
-                    size_t idx = 0;
-                    while (cur)
-                    {
-                        int remove = 0;
-                        if (cur->is_important)
-                        {
-                            prev = cur;
-                            cur = cur->next;
-                            idx++;
-                            continue;
-                        }
-                        if (idx >= keep)
-                        {
-                            if ((now - cur->create_time) > (time_t)(expire_days * 24 * 3600))
-                                remove = 1;
-                        }
-
-                        if (remove)
-                        {
-                            version_node_t *del = cur;
-                            if (prev)
-                                prev->next = cur->next;
-                            else
-                                chain->head = cur->next;
-                            cur = cur->next;
-                            for (size_t i = 0; i < del->snapshot_count; i++)
-                                free(del->snapshots[i].data);
-                            free(del->snapshots);
-                            free(del->diff_blocks);
-                            free(del->block_checksums);
-                            uint64_t key = (chain->file_ino << 32) | (del->version_id & 0xffffffffULL);
-                            if (fs_state.version_cache)
-                                lru_cache_remove(fs_state.version_cache, key);
-                            if (meta && meta->version_count > 0)
-                                meta->version_count--;
-                            if (meta && meta->latest_version_id == del->version_id)
-                                meta->latest_version_id = chain->head ? chain->head->version_id : 0;
-                            chain->count--;
-                        }
-                        else
-                        {
-                            prev = cur;
-                            cur = cur->next;
-                            idx++;
-                        }
-                    }
+                    version_apply_retention_locked(chain, meta, now);
                     pthread_rwlock_unlock(&chain->lock);
                 }
                 node = node->next;
             }
         }
         pthread_mutex_unlock(&versions_mutex);
+
+        /* 刷新缓存脏页（复用清理调度周期） */
+        cache_flush_l2_dirty();
 
         /* 休眠一段时间后继续 */
         sleep(fs_state.version_clean_interval ? fs_state.version_clean_interval : 3600);

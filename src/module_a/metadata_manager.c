@@ -4,6 +4,10 @@
 
 #include "smartbackupfs.h"
 #include "version_manager.h"
+#include "dedup.h"
+#include "module_c/block_splitter.h"
+#include "module_c/cache.h"
+#include "module_c/block_splitter.h"
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -313,6 +317,7 @@ pthread_mutex_t block_maps_mutex = PTHREAD_MUTEX_INITIALIZER;
 static lru_cache_t *inode_cache = NULL;
 static lru_cache_t *block_cache = NULL;
 static pthread_once_t cache_once = PTHREAD_ONCE_INIT;
+dedup_config_t dedup_config;
 
 // 缓存初始化函数
 static void init_caches(void)
@@ -333,8 +338,9 @@ void fs_init(void)
     // 初始化块映射管理
     block_maps = hash_table_create(10000);
 
-    // 设置配置
-    fs_state.block_size = DEFAULT_BLOCK_SIZE;
+    // 设置配置（允许基于分块策略调整块大小）
+    block_splitter_config_t bcfg = block_splitter_default_config();
+    fs_state.block_size = block_splitter_pick_size(&bcfg, DEFAULT_BLOCK_SIZE);
     fs_state.max_cache_size = MAX_CACHE_SIZE;
     fs_state.enable_compression = false;   // 初始关闭
     fs_state.enable_deduplication = false; // 初始关闭
@@ -356,6 +362,14 @@ void fs_init(void)
     fs_state.root->meta.size = DEFAULT_BLOCK_SIZE;
     fs_state.root->meta.blocks = 1;
     fs_state.root->meta.version = 1;
+    fs_state.root->meta.version_count = 0;
+    fs_state.root->meta.latest_version_id = 0;
+    fs_state.root->meta.last_version_time = 0;
+    fs_state.root->meta.version_pinned = false;
+    fs_state.root->meta.version_pinned_set = false;
+    fs_state.root->meta.current_block_map = NULL;
+    fs_state.root->meta.data_hash = 0;
+    pthread_rwlock_init(&fs_state.root->meta.version_lock, NULL);
 
     clock_gettime(CLOCK_REALTIME, &fs_state.root->meta.atime);
     fs_state.root->meta.mtime = fs_state.root->meta.atime;
@@ -371,10 +385,25 @@ void fs_init(void)
     fs_state.total_blocks = 0;
     fs_state.used_blocks = 0;
 
+    /* 初始化去重/压缩配置 */
+    dedup_config.enable_deduplication = fs_state.enable_deduplication;
+    dedup_config.enable_compression = fs_state.enable_compression;
+    dedup_config.algo = COMPRESSION_NONE;
+    dedup_config.compression_level = 1;
+    dedup_config.min_compress_size = 1024;
+    dedup_init(&dedup_config);
+
+    /* 初始化多级缓存（阶段2：L1实现，L2 mmap，L3占位） */
+    cache_system_init(64 * 1024 * 1024, 512 * 1024 * 1024, 10ULL * 1024 * 1024 * 1024);
+
     /* 初始化模块B：版本管理 */
     version_manager_init();
     /* 启动版本清理后台线程 */
     version_manager_start_cleaner();
+
+    /* 保持配置别名同步 */
+    fs_state.max_versions = fs_state.version_max_versions;
+    fs_state.expire_days = fs_state.version_expire_days;
 }
 
 // 销毁文件系统
@@ -397,11 +426,15 @@ void fs_destroy(void)
 
         pthread_rwlock_unlock(&fs_state.root->lock);
         pthread_rwlock_destroy(&fs_state.root->lock);
+        pthread_rwlock_destroy(&fs_state.root->meta.version_lock);
         free(fs_state.root);
     }
 
     // 清理缓存
     cache_clear();
+
+    /* 关闭去重模块 */
+    dedup_shutdown();
 
     /* 销毁版本管理模块 */
     version_manager_destroy();
@@ -453,6 +486,14 @@ file_metadata_t *create_inode(file_type_t type, mode_t mode)
     meta->size = 0;
     meta->blocks = 0;
     meta->version = 1;
+    meta->version_count = 0;
+    meta->latest_version_id = 0;
+    meta->last_version_time = 0;
+    meta->version_pinned = false;
+    meta->version_pinned_set = false;
+    meta->current_block_map = NULL;
+    meta->data_hash = 0;
+    pthread_rwlock_init(&meta->version_lock, NULL);
 
     clock_gettime(CLOCK_REALTIME, &meta->atime);
     meta->mtime = meta->atime;
@@ -483,6 +524,8 @@ void free_inode(file_metadata_t *meta)
     {
         free(meta->xattr);
     }
+
+    pthread_rwlock_destroy(&meta->version_lock);
 
     free(meta);
 }
@@ -723,6 +766,11 @@ data_block_t *allocate_block(size_t size)
     block->file_ino = 0;
     block->offset = 0;
     block->size = size;
+    block->compressed_size = 0;
+    block->compression = COMPRESSION_NONE;
+    memset(block->hash, 0, sizeof(block->hash));
+    block->ref_count = 1;
+    pthread_mutex_init(&block->ref_lock, NULL);
     block->checksum = 0;
     block->next = NULL;
 
@@ -737,10 +785,15 @@ void free_block(data_block_t *block)
     if (!block)
         return;
 
+    cache_invalidate_block(block->block_id);
+    dedup_remove_block(block);
+
     if (block->data)
     {
         free(block->data);
     }
+
+    pthread_mutex_destroy(&block->ref_lock);
 
     fs_state.used_blocks--;
     free(block);
@@ -765,7 +818,19 @@ int read_block(data_block_t *block, char *buf, size_t size, off_t offset)
         to_read = block->size - offset;
     }
 
-    memcpy(buf, block->data + offset, to_read);
+    char *plain = NULL;
+    size_t plain_size = 0;
+    const char *src = block->data;
+    if (block->compressed_size > 0 && block->compression != COMPRESSION_NONE)
+    {
+        if (block_decompress(block, &plain, &plain_size) != 0)
+            return -EIO;
+        src = plain;
+    }
+
+    memcpy(buf, src + offset, to_read);
+    if (plain)
+        free(plain);
     return to_read;
 }
 
@@ -788,13 +853,31 @@ int write_block(data_block_t *block, const char *buf, size_t size, off_t offset)
         to_write = block->size - offset;
     }
 
+    if (block->compressed_size > 0 && block->compression != COMPRESSION_NONE)
+    {
+        char *plain = NULL;
+        size_t plain_size = 0;
+        if (block_decompress(block, &plain, &plain_size) != 0)
+            return -EIO;
+        free(block->data);
+        block->data = plain;
+        block->size = plain_size;
+        block->compressed_size = 0;
+        block->compression = COMPRESSION_NONE;
+    }
+
     memcpy(block->data + offset, buf, to_write);
 
-    // 更新校验和（简单实现）
-    block->checksum = 0;
+    // 更新校验和与简易哈希（供模块C占位）
+    uint32_t sum = 0;
     for (size_t i = 0; i < block->size; i++)
     {
-        block->checksum += block->data[i];
+        sum += (uint8_t)block->data[i];
+    }
+    block->checksum = sum;
+    for (size_t i = 0; i < sizeof(block->hash); i++)
+    {
+        block->hash[i] = (uint8_t)((sum >> ((i % 4) * 8)) ^ (i * 31));
     }
 
     return to_write;
@@ -814,7 +897,16 @@ block_map_t *create_block_map(uint64_t file_ino)
     map->indirect_blocks = 0;
     map->version_block_ids = NULL;
     map->version_block_capacity = 0;
+    map->version_id = 0;
+    map->block_index = hash_table_create(1024);
     pthread_rwlock_init(&map->lock, NULL);
+
+    if (!map->block_index)
+    {
+        pthread_rwlock_destroy(&map->lock);
+        free(map);
+        return NULL;
+    }
 
     return map;
 }
@@ -832,11 +924,14 @@ void destroy_block_map(block_map_t *map)
     {
         if (map->blocks[i])
         {
-            free_block(map->blocks[i]);
+            data_block_t *b = map->blocks[i];
+            dedup_release_block(b);
         }
     }
 
     free(map->blocks);
+    if (map->block_index)
+        hash_table_destroy(map->block_index);
     pthread_rwlock_unlock(&map->lock);
     pthread_rwlock_destroy(&map->lock);
     free(map);
@@ -861,6 +956,41 @@ block_map_t *get_block_map(uint64_t file_ino)
     return map;
 }
 
+/* 计算两个块映射的差异块，结果写入 diff_blocks（key=块索引，value=新块指针） */
+int block_map_diff(block_map_t *old_map, block_map_t *new_map, hash_table_t *diff_blocks)
+{
+    if (!new_map || !diff_blocks)
+        return -EINVAL;
+
+    uint64_t max_blocks = new_map->block_count;
+    if (old_map && old_map->block_count > max_blocks)
+        max_blocks = old_map->block_count;
+
+    for (uint64_t i = 0; i < max_blocks; i++)
+    {
+        data_block_t *oldb = (old_map && i < old_map->block_count) ? old_map->blocks[i] : NULL;
+        data_block_t *newb = (i < new_map->block_count) ? new_map->blocks[i] : NULL;
+
+        uint32_t oldchk = oldb ? oldb->checksum : 0;
+        uint32_t newchk = newb ? newb->checksum : 0;
+
+        if (oldb == NULL && newb == NULL)
+            continue;
+
+        if (oldchk != newchk || (oldb && newb && oldb->size != newb->size))
+        {
+            /* 使用非NULL占位，NULL表示删除，用标记指针1表示删除事件 */
+            void *val = newb ? (void *)newb : (void *)1;
+            hash_table_set(diff_blocks, i, val);
+        }
+    }
+
+    /* 对差异块执行去重/压缩处理（模块C集成） */
+    dedup_process_diff_blocks(diff_blocks, &dedup_config);
+
+    return 0;
+}
+
 // 高性能文件读取（支持大文件）
 int smart_read_file(file_metadata_t *meta, char *buf, size_t size, off_t offset)
 {
@@ -881,6 +1011,8 @@ int smart_read_file(file_metadata_t *meta, char *buf, size_t size, off_t offset)
     block_map_t *map = get_block_map(meta->ino);
     if (!map)
         return -ENOMEM;
+
+    meta->current_block_map = map;
 
     pthread_rwlock_rdlock(&map->lock);
 
@@ -907,6 +1039,11 @@ int smart_read_file(file_metadata_t *meta, char *buf, size_t size, off_t offset)
         else
         {
             data_block_t *block = map->blocks[block_index];
+            data_block_t *cached = NULL;
+            if (block)
+                cached = cache_get_block(block->block_id);
+            if (cached)
+                block = cached;
             if (block)
             {
                 int result = read_block(block, buf + bytes_read, bytes_to_read, block_offset);
@@ -916,6 +1053,14 @@ int smart_read_file(file_metadata_t *meta, char *buf, size_t size, off_t offset)
                     return result;
                 }
                 bytes_read += result;
+                cache_put_block(block);
+
+                /* 预取下一个块以提升顺序读性能 */
+                if (block_index + 1 < map->block_count && map->blocks[block_index + 1])
+                {
+                    uint64_t next_id = map->blocks[block_index + 1]->block_id;
+                    cache_prefetch(&next_id, 1);
+                }
             }
             else
             {
@@ -927,6 +1072,7 @@ int smart_read_file(file_metadata_t *meta, char *buf, size_t size, off_t offset)
 
         current_offset += bytes_to_read;
         remaining_bytes -= bytes_to_read;
+
     }
 
     pthread_rwlock_unlock(&map->lock);
@@ -951,6 +1097,8 @@ int smart_write_file(file_metadata_t *meta, const char *buf, size_t size, off_t 
     block_map_t *map = get_block_map(meta->ino);
     if (!map)
         return -ENOMEM;
+
+    meta->current_block_map = map;
 
     pthread_rwlock_wrlock(&map->lock);
 
@@ -1009,6 +1157,12 @@ int smart_write_file(file_metadata_t *meta, const char *buf, size_t size, off_t 
             }
             map->blocks[block_index]->file_ino = meta->ino;
             map->blocks[block_index]->offset = block_index * fs_state.block_size;
+            if (map->block_index)
+                hash_table_set(map->block_index, map->blocks[block_index]->block_id, map->blocks[block_index]);
+        }
+        else
+        {
+            cache_invalidate_block(map->blocks[block_index]->block_id);
         }
 
         // 写入数据块
@@ -1019,6 +1173,14 @@ int smart_write_file(file_metadata_t *meta, const char *buf, size_t size, off_t 
             pthread_rwlock_unlock(&map->lock);
             return result;
         }
+
+        /* 去重/压缩处理：可能替换块指针 */
+        dedup_process_block_on_write(&map->blocks[block_index], &dedup_config);
+        if (map->block_index && map->blocks[block_index])
+            hash_table_set(map->block_index, map->blocks[block_index]->block_id, map->blocks[block_index]);
+
+        if (map->blocks[block_index])
+            cache_put_block(map->blocks[block_index]);
 
         bytes_written += result;
         current_offset += result;

@@ -27,6 +27,7 @@ include_directories(${FUSE3_INCLUDE_DIRS})
 
 # 查找其他依赖
 find_package(OpenSSL REQUIRED)
+find_package(ZLIB)
 find_library(ZSTD_LIB zstd REQUIRED)
 find_library(LZ4_LIB lz4 REQUIRED)
 find_package(Threads REQUIRED)
@@ -37,12 +38,34 @@ set(SMARTBACKUPFS_SOURCES
     src/module_a/metadata_manager.c
     src/module_a/posix_operations.c
     src/module_b/version_manager.c
+    src/module_c/dedup.c
+    src/module_c/block_splitter.c
+    src/module_c/dedup_core.c
+    src/module_c/adaptive_compress.c
+    src/module_c/storage_monitor_basic.c
+    src/module_c/cache.c
+    src/module_c/system_monitor.c
+    src/module_c/storage.c
+    src/module_c/storage_prediction.c
+    src/module_c/module_d_adapter.c
+    src/module_c/monitor.c
+    src/module_c/compression.c
 )
 
 set(SMARTBACKUPFS_HEADERS
     include/smartbackupfs.h
     include/metadata.h
     include/version_manager.h
+    include/module_c/block_splitter.h
+    include/module_c/dedup_core.h
+    include/module_c/adaptive_compress.h
+    include/module_c/storage_monitor_basic.h
+    include/module_c/cache.h
+    include/module_c/system_monitor.h
+    include/module_c/storage_prediction.h
+    include/module_c/module_d_adapter.h
+    include/module_c.h
+    include/module_c/compression.h
 )
 
 # 可执行文件
@@ -64,6 +87,14 @@ target_link_libraries(smartbackup-fs PRIVATE
     m # 数学库
     dl # 动态加载库
 )
+
+if (ZLIB_FOUND)
+    target_link_libraries(smartbackup-fs PRIVATE ZLIB::ZLIB)
+    target_compile_definitions(smartbackup-fs PRIVATE HAVE_ZLIB=1)
+else()
+    message(WARNING "Zlib not found; GZIP compression disabled")
+    target_compile_definitions(smartbackup-fs PRIVATE HAVE_ZLIB=0)
+endif()
 
 # 设置编译选项
 target_compile_options(smartbackup-fs PRIVATE

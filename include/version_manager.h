@@ -8,32 +8,45 @@
 #include "smartbackupfs.h"
 
 typedef struct version_block_snapshot {
-    size_t size;
-    char *data;
+    size_t size;        /* 拥有的数据大小（仅变更块存储）；未变更时 size=0 且 has_data=false */
+    char *data;         /* 拥有的数据缓冲（仅变更块拷贝） */
+    bool has_data;      /* 标记是否持有数据；未持有则向父版本继承 */
 } version_block_snapshot_t;
 
 typedef struct version_node {
     uint64_t version_id;
-    uint64_t parent_version;
+    uint64_t parent_id;            /* 父版本ID（增量链） */
+    struct version_node *parent;   /* 父版本指针，便于继承数据 */
     time_t create_time;
-    uint64_t *diff_blocks; /* 动态数组，存储变更块索引 */
+    char *description;             /* 版本描述：manual/rename/unlink/periodic 等 */
+    bool is_important;             /* 重要版本标记，清理时跳过 */
+    block_map_t *block_map;        /* 与版本关联的块映射 */
+    uint64_t *diff_blocks;         /* 动态数组，存储变更块索引 */
     size_t diff_count;
-    uint32_t *block_checksums; /* 版本时记录的每个块校验和，用于后续差异计算 */
+    uint32_t *block_checksums;     /* 版本时记录的每个块校验和，用于后续差异计算 */
     size_t block_count;
-    size_t file_size; /* 版本创建时的文件大小 */
-    blkcnt_t blocks;  /* 版本创建时的块数 */
-    bool is_important; /* 重要版本标记，清理时跳过 */
-    version_block_snapshot_t *snapshots; /* 数据快照 */
+    size_t file_size;              /* 版本创建时的文件大小 */
+    blkcnt_t blocks;               /* 版本创建时的块数 */
+    version_block_snapshot_t *snapshots; /* 数据快照（仅存储差异块，其他块继承父版本） */
     size_t snapshot_count;
+    size_t stored_bytes;           /* 本版本新增存储占用（仅差异块数据总和） */
     struct version_node *next;
+    struct version_node *prev;
 } version_node_t;
 
 typedef struct version_chain {
     uint64_t file_ino;
     version_node_t *head; /* 最新版本在head位置 */
+    version_node_t *tail; /* 最早版本 */
     size_t count;
     pthread_rwlock_t lock;
 } version_chain_t;
+
+typedef struct version_history_sample
+{
+    time_t create_time;
+    uint64_t file_size;
+} version_history_sample_t;
 
 /* 初始化/销毁 */
 int version_manager_init(void);
@@ -80,5 +93,8 @@ int version_manager_diff(file_metadata_t *meta, uint64_t v1, uint64_t v2, char *
 
 /* 时间表达式解析辅助：返回目标时间（秒）; 支持 2h / 1d / yesterday */
 time_t version_manager_parse_time_expr(const char *expr);
+
+/* 收集历史版本样本供存储预测使用 */
+size_t version_manager_collect_samples(version_history_sample_t *buf, size_t max_samples);
 
 #endif /* VERSION_MANAGER_H */

@@ -7,6 +7,7 @@
 
 #include "smartbackupfs.h"
 #include "version_manager.h"
+#include "dedup.h"
 #include <fuse3/fuse.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +15,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <strings.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -34,6 +36,61 @@ extern int add_directory_entry(directory_t *dir, const char *name, file_metadata
 extern file_metadata_t *lookup_path(const char *path);
 extern int smart_read_file(file_metadata_t *meta, char *buf, size_t size, off_t offset);
 extern int smart_write_file(file_metadata_t *meta, const char *buf, size_t size, off_t offset);
+
+static bool has_write_permission(file_metadata_t *meta)
+{
+    struct fuse_context *ctx = fuse_get_context();
+    if (!ctx || !meta)
+    {
+        return false;
+    }
+
+    if (ctx->uid == 0)
+    {
+        return true;
+    }
+
+    if (ctx->uid == meta->uid)
+    {
+        return (meta->mode & S_IWUSR) != 0;
+    }
+
+    if (ctx->gid == meta->gid)
+    {
+        return (meta->mode & S_IWGRP) != 0;
+    }
+
+    return (meta->mode & S_IWOTH) != 0;
+}
+
+static const char *compression_algo_to_str(compression_algorithm_t algo)
+{
+    switch (algo)
+    {
+    case COMPRESSION_LZ4:
+        return "lz4";
+    case COMPRESSION_ZSTD:
+        return "zstd";
+    case COMPRESSION_GZIP:
+        return "gzip";
+    case COMPRESSION_NONE:
+    default:
+        return "none";
+    }
+}
+
+static compression_algorithm_t compression_algo_from_str(const char *val)
+{
+    if (!val)
+        return COMPRESSION_NONE;
+    if (strcasecmp(val, "lz4") == 0)
+        return COMPRESSION_LZ4;
+    if (strcasecmp(val, "zstd") == 0)
+        return COMPRESSION_ZSTD;
+    if (strcasecmp(val, "gzip") == 0)
+        return COMPRESSION_GZIP;
+    return COMPRESSION_NONE;
+}
 
 // 获取父目录
 static directory_t *get_parent_directory(const char *path, char **child_name)
@@ -853,6 +910,30 @@ static int smartbackupfs_create(const char *path, mode_t mode,
 }
 
 // 更新时间戳
+static int smartbackupfs_chmod(const char *path, mode_t mode, struct fuse_file_info *fi)
+{
+    (void)fi;
+
+    file_metadata_t *meta = lookup_path(path);
+    if (!meta)
+    {
+        return -ENOENT;
+    }
+
+    struct fuse_context *ctx = fuse_get_context();
+    if (!ctx)
+        return -EACCES;
+
+    if (!(ctx->uid == 0 || ctx->uid == meta->uid))
+    {
+        return -EACCES;
+    }
+
+    meta->mode = (meta->mode & S_IFMT) | (mode & 07777);
+    clock_gettime(CLOCK_REALTIME, &meta->ctime);
+    return 0;
+}
+
 static int smartbackupfs_utimens(const char *path, const struct timespec ts[2],
                                  struct fuse_file_info *fi)
 {
@@ -1085,7 +1166,6 @@ static int smartbackupfs_getxattr(const char *path, const char *name, char *valu
         return -ENOENT;
     }
 
-    // 简化实现：支持 user.comment 与 user.version.pinned
     if (strcmp(name, "user.comment") == 0)
     {
         if (!meta->xattr)
@@ -1093,7 +1173,7 @@ static int smartbackupfs_getxattr(const char *path, const char *name, char *valu
             return -ENODATA;
         }
 
-        size_t attr_len = strlen(meta->xattr);
+        size_t attr_len = strlen(meta->xattr) + 1;
         if (size == 0)
         {
             return attr_len;
@@ -1110,6 +1190,11 @@ static int smartbackupfs_getxattr(const char *path, const char *name, char *valu
 
     if (strcmp(name, "user.version.pinned") == 0)
     {
+        if (!meta->version_pinned_set)
+        {
+            return -ENODATA;
+        }
+
         const char *val = meta->version_pinned ? "1" : "0";
         size_t attr_len = strlen(val) + 1;
         if (size == 0)
@@ -1117,6 +1202,84 @@ static int smartbackupfs_getxattr(const char *path, const char *name, char *valu
         if (size < attr_len)
             return -ERANGE;
         memcpy(value, val, attr_len);
+        return attr_len;
+    }
+
+    if (strcmp(name, "user.version.max_size_mb") == 0)
+    {
+        char buf[32];
+        int n = snprintf(buf, sizeof(buf), "%llu", (unsigned long long)fs_state.version_retention_size_mb);
+        size_t attr_len = (size_t)(n + 1);
+        if (size == 0)
+            return attr_len;
+        if (size < attr_len)
+            return -ERANGE;
+        memcpy(value, buf, attr_len);
+        return attr_len;
+    }
+
+    if (strcmp(name, "user.dedup.enable") == 0)
+    {
+        const char *val = dedup_config.enable_deduplication ? "1" : "0";
+        size_t attr_len = strlen(val) + 1;
+        if (size == 0)
+            return attr_len;
+        if (size < attr_len)
+            return -ERANGE;
+        memcpy(value, val, attr_len);
+        return attr_len;
+    }
+
+    if (strcmp(name, "user.compression.algo") == 0)
+    {
+        const char *val = compression_algo_to_str(dedup_config.algo);
+        size_t attr_len = strlen(val) + 1;
+        if (size == 0)
+            return attr_len;
+        if (size < attr_len)
+            return -ERANGE;
+        memcpy(value, val, attr_len);
+        return attr_len;
+    }
+
+    if (strcmp(name, "user.compression.level") == 0)
+    {
+        char buf[16];
+        int n = snprintf(buf, sizeof(buf), "%d", dedup_config.compression_level);
+        size_t attr_len = (size_t)(n + 1);
+        if (size == 0)
+            return attr_len;
+        if (size < attr_len)
+            return -ERANGE;
+        memcpy(value, buf, attr_len);
+        return attr_len;
+    }
+
+    if (strcmp(name, "user.compression.min_size") == 0)
+    {
+        char buf[32];
+        int n = snprintf(buf, sizeof(buf), "%zu", dedup_config.min_compress_size);
+        size_t attr_len = (size_t)(n + 1);
+        if (size == 0)
+            return attr_len;
+        if (size < attr_len)
+            return -ERANGE;
+        memcpy(value, buf, attr_len);
+        return attr_len;
+    }
+
+    if (strcmp(name, "user.dedup.stats") == 0)
+    {
+        char stats[128];
+        int n = dedup_format_stats(stats, sizeof(stats));
+        if (n < 0)
+            return -EIO;
+        size_t attr_len = (size_t)n + 1;
+        if (size == 0)
+            return attr_len;
+        if (size < attr_len)
+            return -ERANGE;
+        memcpy(value, stats, attr_len);
         return attr_len;
     }
 
@@ -1131,6 +1294,11 @@ static int smartbackupfs_setxattr(const char *path, const char *name,
     if (!meta)
     {
         return -ENOENT;
+    }
+
+    if (!has_write_permission(meta))
+    {
+        return -EACCES;
     }
 
     if (strcmp(name, "user.comment") == 0)
@@ -1154,9 +1322,88 @@ static int smartbackupfs_setxattr(const char *path, const char *name,
 
     if (strcmp(name, "user.version.pinned") == 0)
     {
-        meta->version_pinned = true;
+        bool pinned = true;
+        if (value && size > 0)
+        {
+            pinned = !(value[0] == '0');
+        }
+        meta->version_pinned = pinned;
+        meta->version_pinned_set = true;
         clock_gettime(CLOCK_REALTIME, &meta->ctime);
         return 0;
+    }
+
+    if (strcmp(name, "user.version.max_size_mb") == 0)
+    {
+        char tmp[32] = {0};
+        size_t copy = size < sizeof(tmp) ? size : sizeof(tmp) - 1;
+        memcpy(tmp, value, copy);
+        uint64_t mb = strtoull(tmp, NULL, 10);
+        fs_state.version_retention_size_mb = mb;
+        clock_gettime(CLOCK_REALTIME, &meta->ctime);
+        return 0;
+    }
+
+    if (strcmp(name, "user.dedup.enable") == 0)
+    {
+        bool enable = true;
+        if (value && size > 0)
+            enable = !(value[0] == '0');
+        dedup_config.enable_deduplication = enable;
+        dedup_update_config(dedup_config.enable_deduplication, dedup_config.enable_compression,
+                            dedup_config.algo, dedup_config.compression_level, dedup_config.min_compress_size);
+        clock_gettime(CLOCK_REALTIME, &meta->ctime);
+        return 0;
+    }
+
+    if (strcmp(name, "user.compression.algo") == 0)
+    {
+        char tmp[16] = {0};
+        size_t copy = size < sizeof(tmp) ? size : sizeof(tmp) - 1;
+        memcpy(tmp, value, copy);
+        compression_algorithm_t algo = compression_algo_from_str(tmp);
+        dedup_set_compression(&dedup_config, algo, dedup_config.compression_level);
+        dedup_update_config(dedup_config.enable_deduplication, dedup_config.enable_compression,
+                            dedup_config.algo, dedup_config.compression_level, dedup_config.min_compress_size);
+        clock_gettime(CLOCK_REALTIME, &meta->ctime);
+        return 0;
+    }
+
+    if (strcmp(name, "user.compression.level") == 0)
+    {
+        char tmp[16] = {0};
+        size_t copy = size < sizeof(tmp) ? size : sizeof(tmp) - 1;
+        memcpy(tmp, value, copy);
+        int lvl = (int)strtol(tmp, NULL, 10);
+        if (lvl < 1)
+            lvl = 1;
+        if (lvl > 9)
+            lvl = 9;
+        dedup_config.compression_level = lvl;
+        dedup_update_config(dedup_config.enable_deduplication, dedup_config.enable_compression,
+                            dedup_config.algo, dedup_config.compression_level, dedup_config.min_compress_size);
+        clock_gettime(CLOCK_REALTIME, &meta->ctime);
+        return 0;
+    }
+
+    if (strcmp(name, "user.compression.min_size") == 0)
+    {
+        char tmp[32] = {0};
+        size_t copy = size < sizeof(tmp) ? size : sizeof(tmp) - 1;
+        memcpy(tmp, value, copy);
+        size_t min_sz = (size_t)strtoull(tmp, NULL, 10);
+        if (min_sz < 512)
+            min_sz = 512;
+        dedup_config.min_compress_size = min_sz;
+        dedup_update_config(dedup_config.enable_deduplication, dedup_config.enable_compression,
+                            dedup_config.algo, dedup_config.compression_level, dedup_config.min_compress_size);
+        clock_gettime(CLOCK_REALTIME, &meta->ctime);
+        return 0;
+    }
+
+    if (strcmp(name, "user.dedup.stats") == 0)
+    {
+        return -EPERM; /* 只读 */
     }
 
     if (strcmp(name, "user.version.create") == 0)
@@ -1215,9 +1462,24 @@ static int smartbackupfs_listxattr(const char *path, char *list, size_t size)
         return -ENOENT;
     }
 
-    const char *attrs[] = {"user.comment", "user.version.pinned", "user.version.create", "user.version.delete", "user.version.important"};
-    size_t lens[5] = {strlen(attrs[0]) + 1, strlen(attrs[1]) + 1, strlen(attrs[2]) + 1, strlen(attrs[3]) + 1, strlen(attrs[4]) + 1};
-    size_t total_size = lens[0] + lens[1] + lens[2] + lens[3] + lens[4];
+    const char *attrs[] = {
+        "user.comment",
+        "user.version.pinned",
+        "user.version.max_size_mb",
+        "user.dedup.enable",
+        "user.compression.algo",
+        "user.compression.level",
+        "user.compression.min_size",
+        "user.dedup.stats"};
+    size_t lens[8];
+    for (size_t i = 0; i < 8; i++)
+        lens[i] = strlen(attrs[i]) + 1;
+
+    size_t total_size = lens[2] + lens[3] + lens[4] + lens[5] + lens[6] + lens[7];
+    if (meta->xattr)
+        total_size += lens[0];
+    if (meta->version_pinned_set)
+        total_size += lens[1];
 
     if (size == 0)
         return total_size;
@@ -1225,15 +1487,26 @@ static int smartbackupfs_listxattr(const char *path, char *list, size_t size)
         return -ERANGE;
 
     char *p = list;
-    memcpy(p, attrs[0], lens[0]);
-    p += lens[0];
-    memcpy(p, attrs[1], lens[1]);
-    p += lens[1];
+    if (meta->xattr)
+    {
+        memcpy(p, attrs[0], lens[0]);
+        p += lens[0];
+    }
+    if (meta->version_pinned_set)
+    {
+        memcpy(p, attrs[1], lens[1]);
+        p += lens[1];
+    }
+
+    /* version.max_size_mb 始终列出 */
     memcpy(p, attrs[2], lens[2]);
     p += lens[2];
-    memcpy(p, attrs[3], lens[3]);
-    p += lens[3];
-    memcpy(p, attrs[4], lens[4]);
+
+    for (size_t i = 3; i < 8; i++)
+    {
+        memcpy(p, attrs[i], lens[i]);
+        p += lens[i];
+    }
 
     return total_size;
 }
@@ -1245,6 +1518,11 @@ static int smartbackupfs_removexattr(const char *path, const char *name)
     if (!meta)
     {
         return -ENOENT;
+    }
+
+    if (!has_write_permission(meta))
+    {
+        return -EACCES;
     }
 
     if (strcmp(name, "user.comment") == 0)
@@ -1262,9 +1540,53 @@ static int smartbackupfs_removexattr(const char *path, const char *name)
 
     if (strcmp(name, "user.version.pinned") == 0)
     {
+        if (!meta->version_pinned_set)
+            return -ENODATA;
         meta->version_pinned = false;
+        meta->version_pinned_set = false;
         clock_gettime(CLOCK_REALTIME, &meta->ctime);
         return 0;
+    }
+
+    if (strcmp(name, "user.dedup.enable") == 0)
+    {
+        dedup_config.enable_deduplication = false;
+        dedup_update_config(dedup_config.enable_deduplication, dedup_config.enable_compression,
+                            dedup_config.algo, dedup_config.compression_level, dedup_config.min_compress_size);
+        clock_gettime(CLOCK_REALTIME, &meta->ctime);
+        return 0;
+    }
+
+    if (strcmp(name, "user.compression.algo") == 0)
+    {
+        dedup_set_compression(&dedup_config, COMPRESSION_NONE, dedup_config.compression_level);
+        dedup_update_config(dedup_config.enable_deduplication, dedup_config.enable_compression,
+                            dedup_config.algo, dedup_config.compression_level, dedup_config.min_compress_size);
+        clock_gettime(CLOCK_REALTIME, &meta->ctime);
+        return 0;
+    }
+
+    if (strcmp(name, "user.compression.level") == 0)
+    {
+        dedup_config.compression_level = 1;
+        dedup_update_config(dedup_config.enable_deduplication, dedup_config.enable_compression,
+                            dedup_config.algo, dedup_config.compression_level, dedup_config.min_compress_size);
+        clock_gettime(CLOCK_REALTIME, &meta->ctime);
+        return 0;
+    }
+
+    if (strcmp(name, "user.compression.min_size") == 0)
+    {
+        dedup_config.min_compress_size = 1024;
+        dedup_update_config(dedup_config.enable_deduplication, dedup_config.enable_compression,
+                            dedup_config.algo, dedup_config.compression_level, dedup_config.min_compress_size);
+        clock_gettime(CLOCK_REALTIME, &meta->ctime);
+        return 0;
+    }
+
+    if (strcmp(name, "user.dedup.stats") == 0)
+    {
+        return -EPERM;
     }
 
     if (strcmp(name, "user.version.important") == 0)
@@ -1326,6 +1648,7 @@ static struct fuse_operations smartbackupfs_ops = {
     .fsync = smartbackupfs_fsync,
     .readdir = smartbackupfs_readdir,
     .create = smartbackupfs_create,
+    .chmod = smartbackupfs_chmod,
     .utimens = smartbackupfs_utimens,
     .flush = smartbackupfs_flush,
     .release = smartbackupfs_release,
@@ -1345,19 +1668,21 @@ int main(int argc, char *argv[])
     // 初始化文件系统
     fs_init();
 
-    printf("智能备份文件系统 v4.0\n");
+    printf("智能备份文件系统 v6.0\n");
     printf("支持的功能：\n");
-    printf("  - 完整的POSIX文件操作\n");
-    printf("  - 大文件支持（最大16TB）\n");
-    printf("  - 线程安全并发访问\n");
-    printf("  - 权限和时间戳管理\n");
-    printf("  - 透明版本管理：rename/unlink 事件前自动快照\n");
+    printf("  - 完整的POSIX文件操作，最大16TB，线程安全并发访问\n");
+    printf("  - 权限/时间戳管理与 xattr 支持\n");
+    printf("  - 透明版本管理：rename/unlink 前自动快照\n");
     printf("  - 变化感知版本：写入后块级差异 >10%% 自动建版\n");
     printf("  - 周期版本：后台线程按 version_time_interval 定期创建\n");
     printf("  - 手动管理：xattr user.version.create/delete/important，pinned 跳过清理\n");
-    printf("  - 版本访问：filename@vN / @latest / 时间表达式（s/h/d/w/today/yesterday）\n");
-    printf("  - 版本列表：filename@versions 列出历史版本\n");
-    printf("  - 版本清理：按 max_versions/expire_days 清理，重要版本跳过\n");
+    printf("  - 版本访问：filename@vN/@latest/时间表达式（s/h/d/w/today/yesterday）\n");
+    printf("  - 版本列表与清理：filename@versions，按 max_versions/expire_days 清理，重要版本跳过\n");
+    printf("  - 去重：块级哈希+引用计数，跨文件复用，零引用自动回收\n");
+    printf("  - 自适应压缩：按策略选择 gzip/lz4/none，记录压缩比\n");
+    printf("  - 多级缓存：L1 内存 + L2 文件缓存 + L3 目录缓存，写入级联失效\n");
+    printf("  - 缓存/存储监控：命中率、压缩/去重输入字节与移除计数\n");
+    printf("  - 并发一致性：version_lock + block_index + 引用计数协同\n");
 
     return fuse_main(argc, argv, &smartbackupfs_ops, NULL);
 }

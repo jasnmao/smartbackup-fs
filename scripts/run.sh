@@ -9,6 +9,12 @@ PROJECT_DIR="${SCRIPT_DIR}/.."
 BUILD_DIR="${PROJECT_DIR}/build"
 EXECUTABLE="./build/bin/smartbackup-fs"
 MOUNT_POINT="/tmp/smartbackup"
+DETACH=0
+
+if [[ "${1:-}" == "-d" ]]; then
+    DETACH=1
+    shift
+fi
 
 # 检查可执行文件
 if [[ ! -x "${EXECUTABLE}" ]]; then
@@ -33,12 +39,9 @@ fi
 
 # 运行参数
 ARGS=()
-if [[ "$1" == "-d" ]]; then
-    ARGS+=("-f")  # 前台运行，显示调试信息
-    shift
+if [[ $DETACH -eq 0 ]]; then
+    ARGS+=("-f")
 fi
-
-# 添加其他参数
 ARGS+=("$@")
 ARGS+=("${MOUNT_POINT}")
 
@@ -46,5 +49,13 @@ echo "启动智能备份文件系统..."
 echo "挂载点: ${MOUNT_POINT}"
 echo "参数: ${ARGS[@]}"
 
-# 运行
+if [[ $DETACH -eq 1 ]]; then
+    LOG_FILE="/tmp/smartbackupfs.log"
+    nohup "${EXECUTABLE}" "${ARGS[@]}" >"${LOG_FILE}" 2>&1 &
+    PID=$!
+    echo "已后台运行，PID=${PID}，日志: ${LOG_FILE}"
+    exit 0
+fi
+
+# 前台运行
 exec "${EXECUTABLE}" "${ARGS[@]}"
