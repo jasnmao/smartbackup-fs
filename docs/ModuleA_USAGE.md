@@ -50,13 +50,13 @@ cd smartbackup-fs
 
 ```bash
 # 创建挂载点
-mkdir -p /tmp/myfs
+mkdir -p /tmp/smartbackup
 
 # 启动文件系统（前台模式，显示调试信息）
 ./scripts/run.sh -d
 
 # 或直接运行
-./build/bin/smartbackup-fs /tmp/myfs -f
+./build/bin/smartbackup-fs /tmp/smartbackup -f
 ```
 
 ## 使用示例
@@ -65,7 +65,7 @@ mkdir -p /tmp/myfs
 
 ```bash
 # 挂载后，在挂载点进行操作
-cd /tmp/myfs
+cd /tmp/smartbackup
 
 # 创建目录
 mkdir documents
